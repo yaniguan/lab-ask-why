@@ -1,0 +1,6 @@
+name = "lab_ask_why_lean"
+version = "0.1.0"
+defaultTargets = ["LabAskWhyLean"]
+
+[[lean_lib]]
+name = "LabAskWhyLean"
