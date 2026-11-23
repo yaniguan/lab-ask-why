@@ -20,10 +20,10 @@ Epistemic Socratic co-scientist (`L6`) that decomposes scientific disagreements 
 - **Curated Catalog**: Indexes `SciFact`, `SciRIFF`, and `LAB-Bench`, `9` open-source co-scientist / multi-agent debate / RAG repositories, and `13` foundational & 2026 causal-evidence / disagreement papers.
 
 ### Model
-Zero-parameter Okapi `BM25` sentence ranker ($k_1 = 1.2$, $b = 0.75$) over lowercased `[a-z0-9]+` tokens (29 stopwords removed) with corpus-wide sentence IDF and average sentence length (`avgdl`), paired with a 20-seed uniform random permutation baseline (`np.random.default_rng(0..19)`) and a three-part epistemic question generator (`why_questions`: evidence, assumptions, mind-changing result).
+Zero-parameter indexed Okapi `BM25` sentence and open-corpus ranker ($k_1 = 1.2$, $b = 0.75$, $k_3 = 1.2$) over biomedical-normalized tokens (Greek letters mapped to ASCII names, `+/-` allele markers and decimal/comma numbers preserved, negations `not`/`no`/`neither`/`without` retained) with background-document IDF (`exclude_doc_ids`) and smooth Laplace OOV IDF, benchmarked against `lead-k`, `conclusion-first`, and 20-seed random baselines plus rationale-grounded Socratic `why_questions` and typed `EpistemicProbeResult` JSONL output.
 
 ### Training
-Zero parametric training or LLM API calls (`numpy` + Python standard library on CPU in `< 1s`). On SciFact dev (`n = 209` pairs), `BM25` achieves **`0.493` Hit@1 (`recall@1`)** and **`0.789` Hit@3 (`recall@3`)** against **`0.197 ± 0.024`** and **`0.528 ± 0.029`** for 20-seed random ranking, performing nearly symmetrically on `SUPPORT` (`0.507` / `0.797`, `n=138`) and `CONTRADICT` (`0.465` / `0.775`, `n=71`).
+Zero parametric training or LLM API calls (`numpy` + Python standard library on CPU). On SciFact dev (`300` claims: `188` with evidence yielding `209` pairs + `112` `NOINFO` claims), oracle-abstract `BM25` achieves **`0.809` Hit@3**, **`0.656` fractional Sentence-Recall@3**, and **`0.770` complete Rationale-Set-Recall@3** (`0.826` `SUPPORT` vs `0.775` `CONTRADICT` Hit@3), separates `SUPPORT`/`CONTRADICT` from `NOINFO` cited abstracts at **`0.767` AUROC**, and retrieves **`0.885` `doc_recall@5`** (`0.559` `sentence_hit@3`) in two-stage open-corpus retrieval across all `5,183` abstracts.
 
 ### History
 Initialized in `6236123` (`2026-11-18`) with `demo/why_probe.py`, reference output (`demo/output.txt`), Python 3.12 CI workflow (`.github/workflows/demo.yml`), and curated datasets, repositories, and papers (`2018`–`2026`).
@@ -38,68 +38,49 @@ Initialized in `6236123` (`2026-11-18`) with `demo/why_probe.py`, reference outp
 ```text
 lab-ask-why/
 ├── .github/workflows/
-│   └── demo.yml                      # CI workflow running demo/why_probe.py on Python 3.12
+│   └── demo.yml                      # CI: cache S3 archive, run offline pytest, diff demo/output.txt
 ├── demo/
-│   ├── output.txt                    # Reference stdout capture on SciFact dev (CPU)
-│   └── why_probe.py                  # Okapi BM25 rationale retriever + 20-seed random baseline + why probes
+│   ├── output.txt                    # Deterministic reference stdout capture on SciFact dev (CPU)
+│   └── why_probe.py                  # CLI & benchmark entrypoint for SciFact / custom JSONL corpora
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md   # Deep technical profile (Object, Data, Model, Training, History)
-├── .gitignore                        # Excludes downloaded CC BY-NC 2.0 SciFact data/
+├── src/lab_ask_why/                  # Installable package (BM25, TwoStageRetriever, EpistemicProbeResult, LAB-Bench)
+├── tests/
+│   └── test_why_probe.py             # Offline pytest regression suite (#1..#22)
+├── .gitignore                        # Excludes downloaded CC BY-NC 2.0 SciFact data/ & caches
 ├── LICENSE                           # MIT License (code)
+├── pyproject.toml                    # Package metadata & `lab-ask-why` CLI console script
 ├── README.md                         # Overview, demo results, and curated co-scientist/debate catalog
-└── requirements.txt                  # Minimal dependency (numpy)
+└── requirements.txt                  # Bounded dependency (numpy>=1.26,<3.0)
 ```
 
-## First attempt
-
-SciFact dev set (claims checked against paper abstracts; gold rationale sentences marked). For each claim and its evidence abstract, BM25 (plain Python and numpy) ranks the abstract's sentences against the claim. A hit means a gold rationale sentence is in the top k. Random sentence ranking (20 seeds) is the baseline. The script also prints three template "why" questions per claim.
+## Quickstart & CLI
 
 ```bash
-pip install numpy
+pip install -r requirements.txt -e .
 python demo/why_probe.py
+lab-ask-why --claim "GWAS identifies rare synthetic associations." --offline --json
+lab-ask-why --export-schema epistemic_probe.schema.json
 ```
 
-Output (Linux, CPU only, 2026-11-18):
+Output (`demo/output.txt`, CPU only):
 
 ```
-SciFact dev: rationale sentence retrieval inside gold evidence abstracts
-claims with evidence: 188   claim-doc pairs: 209   labels: {'SUPPORT': 138, 'CONTRADICT': 71}
-sentences per abstract: mean 9.7, median 8
+SciFact dev: rationale sentence retrieval & open-corpus epistemic probing
+total claims: 300   with evidence: 188   NOINFO: 112   claim-doc pairs: 209   labels: {'SUPPORT': 138, 'CONTRADICT': 71}
+sentences per abstract: mean 9.7, median 8   (IDF scope: background)
 
-method                  recall@1  recall@3
-BM25                       0.493     0.789
+method                     hit@1     hit@3  sent_rec@1  sent_rec@3  set_rec@1  set_rec@3
+BM25                       0.488     0.809       0.346       0.656      0.459      0.770
+lead-k (position)          0.057     0.263
+conclusion-first           0.249     0.679
 random (20 seeds)          0.197     0.528
   random std               0.024     0.029
-BM25 SUPPORT               0.507     0.797   (n=138)
-BM25 CONTRADICT            0.465     0.775   (n=71)
+BM25 SUPPORT               0.522     0.826       0.383       0.685      0.493      0.775   (n=138)
+BM25 CONTRADICT            0.423     0.775       0.274       0.598      0.394      0.761   (n=71)
 
-======================================================================
-Claim: 1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants.
-Abstract: Rare Variants Create Synthetic Genome-Wide Associations
-Gold label: SUPPORT   gold rationale sentences: [2, 5, 7]
-Top-3 BM25 sentences:
-  1.*[s7] In conclusion, uncommon or rare genetic variants can easily create synthetic associations that are credited to common variants, and this possibility requires careful consideration in the interpretation and follow up of GWAS signals.
-  2. [s0] Genome-wide association studies (GWAS) have now identified at least 2,000 common variants that appear associated with common diseases or related traits (http://www.genome.gov/gwastudies), hundreds of which have been convincingly replicated.
-  3.*[s2] We propose as an alternative explanation that variants much less common than the associated one may create "synthetic associations" by occurring, stochastically, more often in association with one of the alleles at the common site versus the other allele.
-Why questions:
-  - What evidence makes you think that 1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants?
-  - What are you assuming must be true for '1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants' to hold?
-  - What result would change your mind about '1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants'?
-
-======================================================================
-Claim: A high microerythrocyte count raises vulnerability to severe anemia in homozygous alpha (+)- thalassemia trait subjects.
-Abstract: Increased Microerythrocyte Count in Homozygous α+-Thalassaemia Contributes to Protection against Severe Malarial Anaemia
-Gold label: CONTRADICT   gold rationale sentences: [1, 9, 10]
-Top-3 BM25 sentences:
-  1.*[s1] Individuals homozygous for alpha(+)-thalassaemia have microcytosis and an increased erythrocyte count.
-  2.*[s10] CONCLUSIONS The increased erythrocyte count and microcytosis in children homozygous for alpha(+)-thalassaemia may contribute substantially to their protection against SMA.
-  3. [s7] This model predicted that children homozygous for alpha(+)-thalassaemia lose less Hb than children of normal genotype for a reduction in erythrocyte count of >1.1 x 10(12)/l as a result of the reduced mean cell Hb in homozygous alpha(+)-thalassaemia.
-Why questions:
-  - What evidence makes you think that a high microerythrocyte count raises vulnerability to severe anemia in homozygous alpha (+)- thalassemia trait subjects?
-  - What are you assuming must be true for 'A high microerythrocyte count raises vulnerability to severe anemia in homozygous alpha (+)- thalassemia trait subjects' to hold?
-  - What result would change your mind about 'A high microerythrocyte count raises vulnerability to severe anemia in homozygous alpha (+)- thalassemia trait subjects'?
-
-(* = gold rationale sentence)
+Epistemic abstention (SUPPORT/CONTRADICT vs NOINFO cited abstracts, n_noinfo_pairs=114): max-BM25 mean 24.02 vs 13.32 | AUROC = 0.767
+Open-corpus 2-stage BM25 (all 5,183 abstracts, top-5 docs -> top-3 sents): doc_recall@5 = 0.885 | sentence_hit@3 = 0.559 | NOINFO FDR = 0.375
 ```
 
 Plain BM25 finds a supporting or contradicting reason in the top 3 for 0.79 of claim-abstract pairs, against 0.53 for random ranking (abstracts are short, about 10 sentences). It works about equally for SUPPORT and CONTRADICT. Next: retrieve across many papers (not only the gold abstract) and turn retrieved reasons into a proposed discriminating experiment.

@@ -1,0 +1,92 @@
+"""lab-ask-why: Epistemic Socratic co-scientist for scientific disagreements."""
+from __future__ import annotations
+
+from lab_ask_why.bm25 import BM25, GREEK_MAP, STOP, normalize_biomedical_text, tokenize
+from lab_ask_why.data import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_ROOT,
+    OFFLINE_MINI_CLAIMS,
+    OFFLINE_MINI_CORPUS,
+    SCIFACT_SHA256,
+    SCIFACT_URL,
+    build_noinfo_pairs,
+    build_pairs,
+    ensure_data,
+    read_jsonl,
+    safe_extract_tar,
+    validate_tar_member,
+)
+from lab_ask_why.labbench_adapter import (
+    CANARY_NEEDLES,
+    CounterfactualConsistencyPacket,
+    CounterfactualProbeScorer,
+    contains_canary,
+    load_labbench_items,
+    probe_labbench_item,
+    segment_protocol_sentences,
+)
+from lab_ask_why.metrics import (
+    compute_auroc,
+    conclusion_first_rankings,
+    hit_at,
+    lead_rankings,
+    rank_scores,
+    rationale_set_recall_at,
+    recall_at,
+    sentence_recall_at,
+)
+from lab_ask_why.retrieval import TwoStageRetriever, classify_rationale_polarity
+from lab_ask_why.schema import (
+    EPISTEMIC_PROBE_JSON_SCHEMA,
+    DiscriminatingObservable,
+    EpistemicProbeResult,
+    RationaleEvidence,
+    export_probes_jsonl,
+    load_probes_jsonl,
+)
+from lab_ask_why.socratic import extract_differential_terms, why_questions
+
+__all__ = [
+    "BM25",
+    "CANARY_NEEDLES",
+    "CounterfactualConsistencyPacket",
+    "CounterfactualProbeScorer",
+    "DEFAULT_DATA_DIR",
+    "DEFAULT_ROOT",
+    "DiscriminatingObservable",
+    "EPISTEMIC_PROBE_JSON_SCHEMA",
+    "EpistemicProbeResult",
+    "GREEK_MAP",
+    "OFFLINE_MINI_CLAIMS",
+    "OFFLINE_MINI_CORPUS",
+    "RationaleEvidence",
+    "SCIFACT_SHA256",
+    "SCIFACT_URL",
+    "STOP",
+    "TwoStageRetriever",
+    "build_noinfo_pairs",
+    "build_pairs",
+    "classify_rationale_polarity",
+    "compute_auroc",
+    "conclusion_first_rankings",
+    "contains_canary",
+    "ensure_data",
+    "export_probes_jsonl",
+    "extract_differential_terms",
+    "hit_at",
+    "lead_rankings",
+    "load_labbench_items",
+    "load_probes_jsonl",
+    "normalize_biomedical_text",
+    "probe_labbench_item",
+    "rank_scores",
+    "rationale_set_recall_at",
+    "read_jsonl",
+    "recall_at",
+    "safe_extract_tar",
+    "segment_protocol_sentences",
+    "sentence_recall_at",
+    "tokenize",
+    "validate_tar_member",
+    "why_questions",
+]
