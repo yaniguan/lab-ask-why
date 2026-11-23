@@ -2,9 +2,53 @@
 
 A co-scientist that does not pick a winner. It asks *"why do you think so?"*, finds the evidence on each side, and names the result that would change minds.
 
+> **Auto-Lab Ecosystem**: Layer `L6 · Metacognitive & Epistemic Brain` in [auto-lab](https://github.com/yaniguan/auto-lab) · [Project Studio](https://yaniguan.github.io/auto-lab/)
+
 ## Where it fits
 
-In the lab agent on [yaniguan.github.io](https://yaniguan.github.io/), the co-scientist proposes the next simulation or experiment. Here it is a partner in a disagreement. It surfaces the evidence and assumptions behind each claim, then suggests the test that tells them apart. The first attempt finds the sentences behind a claim in real abstracts.
+In the [Auto-Lab](https://github.com/yaniguan/auto-lab) agent ([yaniguan.github.io/auto-lab](https://yaniguan.github.io/auto-lab/) · [yaniguan.github.io](https://yaniguan.github.io/)), the co-scientist proposes the next simulation or experiment. Here it is a partner in a disagreement. It surfaces the evidence and assumptions behind each claim, then suggests the test that tells them apart. The first attempt finds the sentences behind a claim in real abstracts.
+
+## System Profile: Object · Data · Model · Training · History · Unique Properties
+
+Full architectural documentation, dataset breakdowns, retrieval equations, commit lineage, and sibling-repository contracts are maintained in [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
+
+### Object
+Epistemic Socratic co-scientist (`L6`) that decomposes scientific disagreements without premature verdict collapse—retrieving verbatim supporting and contradicting rationale sentences from primary abstracts, surfacing required assumptions, and framing the discriminating experimental outcome that would change minds.
+
+### Data
+- **Active Benchmark (`SciFact`, Wadden et al. 2020)**: Downloaded on demand to gitignored `data/` (`CC BY-NC 2.0`, zero redistribution): `5,183` abstracts (`corpus.jsonl`; mean `9.7`, median `8` sentences/abstract) and `300` dev claims (`claims_dev.jsonl`), of which `188` evidence-bearing claims yield **`209` `(claim, doc_id)` pairs** (`138` `SUPPORT`, `71` `CONTRADICT`; `112` `NOINFO` claims excluded).
+- **Curated Catalog**: Indexes `SciFact`, `SciRIFF`, and `LAB-Bench`, `9` open-source co-scientist / multi-agent debate / RAG repositories, and `13` foundational & 2026 causal-evidence / disagreement papers.
+
+### Model
+Zero-parameter Okapi `BM25` sentence ranker ($k_1 = 1.2$, $b = 0.75$) over lowercased `[a-z0-9]+` tokens (29 stopwords removed) with corpus-wide sentence IDF and average sentence length (`avgdl`), paired with a 20-seed uniform random permutation baseline (`np.random.default_rng(0..19)`) and a three-part epistemic question generator (`why_questions`: evidence, assumptions, mind-changing result).
+
+### Training
+Zero parametric training or LLM API calls (`numpy` + Python standard library on CPU in `< 1s`). On SciFact dev (`n = 209` pairs), `BM25` achieves **`0.493` Hit@1 (`recall@1`)** and **`0.789` Hit@3 (`recall@3`)** against **`0.197 ± 0.024`** and **`0.528 ± 0.029`** for 20-seed random ranking, performing nearly symmetrically on `SUPPORT` (`0.507` / `0.797`, `n=138`) and `CONTRADICT` (`0.465` / `0.775`, `n=71`).
+
+### History
+Initialized in `6236123` (`2026-11-18`) with `demo/why_probe.py`, reference output (`demo/output.txt`), Python 3.12 CI workflow (`.github/workflows/demo.yml`), and curated datasets, repositories, and papers (`2018`–`2026`).
+
+### Unique Properties
+- **Polarity-Symmetric Stance Neutrality**: Retrieves supporting and contradicting rationales with near-equal fidelity (`0.797` vs. `0.775` top-3 hit rate) rather than forcing binary adjudication.
+- **Zero-Cost Auditable Baseline**: Establishes a fast, deterministic lexical attribution baseline before adding open-corpus retrieval or neural rerankers.
+- **Ecosystem Interfaces**: Pairs at `L6` with [`lab-decide`](https://github.com/yaniguan/lab-decide) (conformal trust-region gating & BO), connects upstream to [`YLM`](https://github.com/yaniguan/YLM) (`L0`) and [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3` `LitQA2`/`ProtocolQA` & calibrated rewards), and feeds discriminating tests downstream to [`labshift`](https://github.com/yaniguan/labshift) (`L5`), [`lab-verify`](https://github.com/yaniguan/lab-verify), and [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal) (`L4`).
+
+## Repository Layout
+
+```text
+lab-ask-why/
+├── .github/workflows/
+│   └── demo.yml                      # CI workflow running demo/why_probe.py on Python 3.12
+├── demo/
+│   ├── output.txt                    # Reference stdout capture on SciFact dev (CPU)
+│   └── why_probe.py                  # Okapi BM25 rationale retriever + 20-seed random baseline + why probes
+├── docs/
+│   └── ARCHITECTURE_AND_HISTORY.md   # Deep technical profile (Object, Data, Model, Training, History)
+├── .gitignore                        # Excludes downloaded CC BY-NC 2.0 SciFact data/
+├── LICENSE                           # MIT License (code)
+├── README.md                         # Overview, demo results, and curated co-scientist/debate catalog
+└── requirements.txt                  # Minimal dependency (numpy)
+```
 
 ## First attempt
 
