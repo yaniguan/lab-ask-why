@@ -53,11 +53,13 @@ def evaluate_scifact_benchmark(
     if idf_scope == "background":
         eval_doc_ids = {str(p["doc_id"]) for p in pairs} | {str(p["doc_id"]) for p in noinfo_pairs}
         has_bg = any(str(did) not in eval_doc_ids for did in corpus.keys())
+        bg_exclude_ids: set[str] | None = eval_doc_ids if has_bg else None
         bm25, _ = BM25.from_corpus(
             corpus,
-            exclude_doc_ids=(eval_doc_ids if has_bg else None),
+            exclude_doc_ids=bg_exclude_ids,
         )
     elif idf_scope == "full":
+        bg_exclude_ids = None
         bm25, _ = BM25.from_corpus(corpus, exclude_doc_ids=None)
     else:
         raise ValueError(f"Unsupported idf_scope: {idf_scope!r}")
@@ -88,7 +90,7 @@ def evaluate_scifact_benchmark(
     noinfo_auroc = compute_auroc(pos_max, neg_max)
 
     # Open-corpus two-stage retrieval across all corpus abstracts and all claims
-    open_retriever = TwoStageRetriever(corpus)
+    open_retriever = TwoStageRetriever(corpus, exclude_doc_ids=bg_exclude_ids)
     open_metrics = open_retriever.evaluate_claims(
         all_claims,
         doc_top_m=doc_top_m,

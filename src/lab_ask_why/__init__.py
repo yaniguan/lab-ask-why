@@ -37,18 +37,31 @@ from lab_ask_why.metrics import (
 )
 from lab_ask_why.retrieval import TwoStageRetriever, classify_rationale_polarity
 from lab_ask_why.schema import (
+    CONTROL_WELL_ROLES,
     EPISTEMIC_PROBE_JSON_SCHEMA,
+    ControlWellSpec,
     DiscriminatingObservable,
     EpistemicProbeResult,
     RationaleEvidence,
+    check_ask_why_permille,
+    check_epistemic_graph_permille,
     export_probes_jsonl,
     load_probes_jsonl,
+    to_permille_ceil,
+    to_permille_floor,
 )
-from lab_ask_why.socratic import extract_differential_terms, why_questions
+from lab_ask_why.socratic import (
+    extract_differential_terms,
+    extract_protocol_descriptors,
+    synthesize_control_wells,
+    why_questions,
+)
 
 __all__ = [
     "BM25",
     "CANARY_NEEDLES",
+    "CONTROL_WELL_ROLES",
+    "ControlWellSpec",
     "CounterfactualConsistencyPacket",
     "CounterfactualProbeScorer",
     "DEFAULT_DATA_DIR",
@@ -66,6 +79,8 @@ __all__ = [
     "TwoStageRetriever",
     "build_noinfo_pairs",
     "build_pairs",
+    "check_ask_why_permille",
+    "check_epistemic_graph_permille",
     "classify_rationale_polarity",
     "compute_auroc",
     "conclusion_first_rankings",
@@ -73,6 +88,7 @@ __all__ = [
     "ensure_data",
     "export_probes_jsonl",
     "extract_differential_terms",
+    "extract_protocol_descriptors",
     "hit_at",
     "lead_rankings",
     "load_labbench_items",
@@ -86,6 +102,9 @@ __all__ = [
     "safe_extract_tar",
     "segment_protocol_sentences",
     "sentence_recall_at",
+    "synthesize_control_wells",
+    "to_permille_ceil",
+    "to_permille_floor",
     "tokenize",
     "validate_tar_member",
     "why_questions",

@@ -3,16 +3,16 @@ total claims: 300   with evidence: 188   NOINFO: 112   claim-doc pairs: 209   la
 sentences per abstract: mean 9.7, median 8   (IDF scope: background)
 
 method                     hit@1     hit@3  sent_rec@1  sent_rec@3  set_rec@1  set_rec@3
-BM25                       0.488     0.809       0.346       0.656      0.459      0.770
+BM25                       0.483     0.813       0.341       0.658      0.455      0.775
 lead-k (position)          0.057     0.263
 conclusion-first           0.249     0.679
 random (20 seeds)          0.197     0.528
   random std               0.024     0.029
-BM25 SUPPORT               0.522     0.826       0.383       0.685      0.493      0.775   (n=138)
-BM25 CONTRADICT            0.423     0.775       0.274       0.598      0.394      0.761   (n=71)
+BM25 SUPPORT               0.514     0.826       0.376       0.685      0.486      0.775   (n=138)
+BM25 CONTRADICT            0.423     0.789       0.274       0.605      0.394      0.775   (n=71)
 
-Epistemic abstention (SUPPORT/CONTRADICT vs NOINFO cited abstracts, n_noinfo_pairs=114): max-BM25 mean 24.02 vs 13.32 | AUROC = 0.767
-Open-corpus 2-stage BM25 (all 5,183 abstracts, top-5 docs -> top-3 sents): doc_recall@5 = 0.885 | sentence_hit@3 = 0.559 | NOINFO FDR = 0.375
+Epistemic abstention (SUPPORT/CONTRADICT vs NOINFO cited abstracts, n_noinfo_pairs=114): max-BM25 mean 23.99 vs 13.34 | AUROC = 0.765
+Open-corpus 2-stage BM25 (all 5,183 abstracts, top-5 docs -> top-3 sents): doc_recall@5 = 0.880 | sentence_hit@3 = 0.596 | NOINFO FDR = 0.321
 
 ======================================================================
 Claim: 1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants.

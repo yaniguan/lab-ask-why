@@ -4,14 +4,17 @@ Inspired by the autonomous solid-state synthesis XRD characterization debate
 (A-Lab precursor peak overlap analysis and CederGroupHub/alab_gpss_public).
 Deconvolves observed 1D diffraction or optical spectra as non-negative linear
 combinations of starting precursor reference patterns plus a putative novel
-target phase, computing `precursor_overlap_permille` and `residual_rwp_permille`
+target phase, computing conservative upward (`ceil`) `precursor_overlap_permille`
+and `residual_rwp_permille` under scale-invariant unit-peak reference normalization
 in exact alignment with `LabAskWhyLean.AssayTelemetry` (`unidentifiable_spectrum_never_certified`).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING
 
 import numpy as np
 
@@ -28,6 +31,26 @@ class GhostDeconvolutionResult:
     attribution_outcome: str
     admit_to_memory: bool
     claim_blocked: bool
+
+
+def _ceil_permille(ratio: float) -> int:
+    """Conservatively quantize a non-negative error/overlap ratio upward to integer permille."""
+    val = float(ratio)
+    if not math.isfinite(val):
+        raise ValueError(f"Expected finite ratio for permille conversion, got {ratio!r}")
+    if val <= 1e-12:
+        return 0
+    clamped = max(0.0, min(1.0, val))
+    scaled = (Decimal(str(clamped)) * Decimal(1000)).to_integral_value(rounding=ROUND_CEILING)
+    return max(0, min(1000, int(scaled)))
+
+
+def _unit_peak_normalize(profile: np.ndarray) -> tuple[np.ndarray, float]:
+    """Normalize a non-negative 1D profile to unit L-infinity peak (`I_max = 1.0`)."""
+    peak = float(np.max(profile)) if profile.size > 0 else 0.0
+    if peak <= 1e-12:
+        return np.zeros_like(profile, dtype=np.float64), 0.0
+    return profile / peak, peak
 
 
 def nnls_solve(
@@ -77,17 +100,18 @@ def naive_peak_match_claim(
     match_fraction_thresh: float = 0.70,
 ) -> bool:
     """Naive phase matcher checking only if observed intensity appears at target Bragg windows."""
-    y_vec = np.asarray(observed, dtype=np.float64)
-    t_vec = np.asarray(target_profile, dtype=np.float64)
-    t_max = float(np.max(t_vec)) if t_vec.size > 0 else 0.0
-    if t_max <= 1e-12:
+    y_raw = np.maximum(0.0, np.asarray(observed, dtype=np.float64))
+    t_raw = np.maximum(0.0, np.asarray(target_profile, dtype=np.float64))
+    y_vec, y_peak = _unit_peak_normalize(y_raw)
+    t_vec, t_peak = _unit_peak_normalize(t_raw)
+    if y_peak <= 1e-12 or t_peak <= 1e-12:
         return False
 
-    target_mask = t_vec >= (peak_rel_height * t_max)
+    target_mask = t_vec >= peak_rel_height
     if not np.any(target_mask):
         return False
 
-    matched = y_vec[target_mask] >= (intensity_floor * t_max)
+    matched = y_vec[target_mask] >= intensity_floor
     return float(np.mean(matched)) >= match_fraction_thresh
 
 
@@ -101,20 +125,46 @@ def deconvolve_precursor_ghosts(
     max_overlap_permille: int = 150,
     activity_weight_thresh: float = 0.25,
 ) -> GhostDeconvolutionResult:
-    """Deconvolve starting precursors against a putative novel phase and attribute outcome."""
-    y_vec = np.maximum(0.0, np.asarray(observed, dtype=np.float64))
-    t_vec = np.maximum(0.0, np.asarray(target_profile, dtype=np.float64))
-    if y_vec.ndim != 1 or t_vec.shape != y_vec.shape:
+    """Deconvolve starting precursors against a putative novel phase under unit-peak invariance."""
+    obs_arr = np.asarray(observed, dtype=np.float64)
+    tgt_arr = np.asarray(target_profile, dtype=np.float64)
+    if not np.all(np.isfinite(obs_arr)) or not np.all(np.isfinite(tgt_arr)):
+        raise ValueError("observed and target_profile must contain finite values")
+
+    y_raw = np.maximum(0.0, obs_arr)
+    t_raw = np.maximum(0.0, tgt_arr)
+    if y_raw.ndim != 1 or t_raw.shape != y_raw.shape:
         raise ValueError(
             "observed and target_profile must be 1D arrays of equal length"
         )
 
-    prec_cols = [
-        np.maximum(0.0, np.asarray(p, dtype=np.float64)) for p in precursor_profiles
-    ]
-    for p_col in prec_cols:
-        if p_col.shape != y_vec.shape:
+    prec_raw_cols: list[np.ndarray] = []
+    for p in precursor_profiles:
+        p_arr = np.asarray(p, dtype=np.float64)
+        if not np.all(np.isfinite(p_arr)):
+            raise ValueError("precursor_profiles must contain finite values")
+        if p_arr.shape != y_raw.shape:
             raise ValueError("All precursor profiles must match observed length")
+        prec_raw_cols.append(np.maximum(0.0, p_arr))
+
+    # Peak-normalize observed, precursor cards, and target reference card to unit L-inf peak
+    # so standard CIF cards (I_max = 100 or 1000) behave identically to unit-scaled profiles.
+    y_vec, y_peak = _unit_peak_normalize(y_raw)
+    t_vec, t_peak = _unit_peak_normalize(t_raw)
+    prec_cols = [_unit_peak_normalize(p_col)[0] for p_col in prec_raw_cols]
+
+    if y_peak <= 1e-12:
+        outcome = "execution_artifact" if not execution_clean else "certified_negative"
+        return GhostDeconvolutionResult(
+            precursor_weights=tuple(0.0 for _ in prec_cols),
+            target_weight=0.0,
+            precursor_overlap_permille=0,
+            residual_rwp_permille=0,
+            signal_above_activity_thresh=False,
+            attribution_outcome=outcome,
+            admit_to_memory=outcome in ("certified_positive", "certified_negative"),
+            claim_blocked=False,
+        )
 
     if prec_cols:
         p_mat = np.column_stack(prec_cols)
@@ -128,32 +178,39 @@ def deconvolve_precursor_ghosts(
 
     w_joint = nnls_solve(joint_mat, y_vec)
     w_joint_prec = w_joint[:-1]
-    w_target = float(w_joint[-1])
+    w_target = float(w_joint[-1]) if t_peak > 1e-12 else 0.0
     y_joint = joint_mat @ w_joint
 
     obs_norm = max(float(np.linalg.norm(y_vec)), 1e-12)
     res_norm = float(np.linalg.norm(y_vec - y_joint))
-    residual_rwp_permille = int(min(1000, round(1000.0 * res_norm / obs_norm)))
+    residual_rwp_permille = _ceil_permille(res_norm / obs_norm)
 
-    t_max = max(float(np.max(t_vec)), 1e-12)
-    target_mask = t_vec >= (0.20 * t_max)
-    obs_in_target = float(np.sum(y_vec[target_mask]))
-    prec_explained_in_target = float(
-        np.sum(np.minimum(y_vec[target_mask], y_prec_only[target_mask]))
-    )
-    ref_floor = float(activity_weight_thresh * np.sum(t_vec[target_mask]))
-    denom = max(obs_in_target, ref_floor, 1e-12)
-    precursor_overlap_permille = int(
-        min(1000, max(0, round(1000.0 * prec_explained_in_target / denom)))
-    )
+    if t_peak > 1e-12:
+        target_mask = t_vec >= 0.20
+    else:
+        target_mask = np.zeros_like(t_vec, dtype=bool)
 
-    # Apparent signal in target peak region (mirrors raw hit detector before attribution guard)
-    apparent_signal_ratio = obs_in_target / max(
-        float(np.sum(t_vec[target_mask])), 1e-12
-    )
+    if np.any(target_mask):
+        obs_in_target = float(np.sum(y_vec[target_mask]))
+        prec_explained_in_target = float(
+            np.sum(np.minimum(y_vec[target_mask], y_prec_only[target_mask]))
+        )
+        ref_floor = float(activity_weight_thresh * np.sum(t_vec[target_mask]))
+        denom = max(obs_in_target, ref_floor, 1e-12)
+        precursor_overlap_permille = _ceil_permille(prec_explained_in_target / denom)
+        apparent_signal_ratio = obs_in_target / max(
+            float(np.sum(t_vec[target_mask])), 1e-12
+        )
+    else:
+        precursor_overlap_permille = 0
+        apparent_signal_ratio = 0.0
+
     signal_above_thresh = bool(
-        w_target >= activity_weight_thresh
-        or apparent_signal_ratio >= activity_weight_thresh
+        t_peak > 1e-12
+        and (
+            w_target >= activity_weight_thresh
+            or apparent_signal_ratio >= activity_weight_thresh
+        )
     )
 
     if not execution_clean:
@@ -212,14 +269,12 @@ def run_benchmark(n_spectra: int = 60, seed: int = 42) -> dict[str, object]:
 
     for idx in range(n_spectra):
         regime = idx % 4
-        # Base precursor peaks
         p1_centers = [18.5, 31.2, 44.8, 59.0]
         p2_centers = [24.0, 36.6, 51.5, 66.2]
         p1 = _gaussian_peaks(grid, p1_centers, [1.0, 0.75, 0.60, 0.45])
         p2 = _gaussian_peaks(grid, p2_centers, [0.9, 1.0, 0.55, 0.40])
 
         if regime == 0:
-            # Genuine novel phase with distinct non-overlapping Bragg reflections
             true_positives_total += 1
             t_prof = _gaussian_peaks(
                 grid, [21.4, 28.7, 40.3, 55.1], [1.0, 0.90, 0.80, 0.65]
@@ -231,8 +286,6 @@ def run_benchmark(n_spectra: int = 60, seed: int = 42) -> dict[str, object]:
             obs = np.maximum(0.0, w1 * p1 + w2 * p2 + wt * t_prof + noise)
             is_true_novel = True
         elif regime == 1:
-            # A-Lab ghost-peak overlap trap: putative target shares peak positions with p1 + p2,
-            # and run contains ONLY unreacted precursors (zero true novel phase!)
             t_prof = _gaussian_peaks(
                 grid,
                 [18.55, 31.15, 36.65, 51.45],
@@ -244,7 +297,6 @@ def run_benchmark(n_spectra: int = 60, seed: int = 42) -> dict[str, object]:
             obs = np.maximum(0.0, w1 * p1 + w2 * p2 + noise)
             is_true_novel = False
         elif regime == 2:
-            # Unidentified side-phase / impurity with partial coincidental overlap + high R_wp
             t_prof = _gaussian_peaks(grid, [24.05, 36.60, 48.2], [0.85, 0.90, 0.65])
             impurity = _gaussian_peaks(
                 grid, [15.2, 29.8, 48.2, 62.7, 73.1], [0.9, 1.1, 0.8, 0.9, 0.7]
@@ -255,7 +307,6 @@ def run_benchmark(n_spectra: int = 60, seed: int = 42) -> dict[str, object]:
             )
             is_true_novel = False
         else:
-            # Clean negative run: precursors unreacted, target lines completely absent & disjoint
             t_prof = _gaussian_peaks(
                 grid, [14.2, 27.9, 41.6, 63.4], [1.0, 0.85, 0.75, 0.50]
             )

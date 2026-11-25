@@ -81,10 +81,62 @@ class CruxSelectionResult:
     top_pair: tuple[str, str] | None
 
 
-def _symmetric_evidence_strength(hyp: MechanisticHypothesis) -> float:
-    """Compute stance-symmetric evidence score preserving both support and contradiction."""
-    sup = sum(s.bm25_score for s in hyp.support_evidence)
-    con = sum(s.bm25_score for s in hyp.contradict_evidence)
+def _validate_unique_hypotheses(hypotheses: Sequence[MechanisticHypothesis]) -> list[str]:
+    if not hypotheses:
+        raise ValueError("hypotheses must be non-empty")
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for hyp in hypotheses:
+        hid = hyp.hypothesis_id
+        if not hid or not str(hid).strip():
+            raise ValueError("hypothesis_id must be non-empty")
+        if hid in seen:
+            raise ValueError(f"Duplicate hypothesis_id detected: {hid!r}")
+        seen.add(hid)
+        ordered_ids.append(hid)
+    return ordered_ids
+
+
+def _validate_perturbation_likelihood_keys(
+    hypothesis_ids: Sequence[str],
+    perturbation: CandidatePerturbation,
+) -> None:
+    missing = [
+        hid for hid in hypothesis_ids if hid not in perturbation.likelihood_positive_by_hypothesis
+    ]
+    if missing:
+        raise ValueError(
+            f"CandidatePerturbation {perturbation.experiment_id!r} is missing likelihood entries "
+            f"for hypothesis IDs: {missing}"
+        )
+
+
+def _saturated_pool_score(
+    snippets: Sequence[EvidenceSnippet],
+    *,
+    snippet_floor: float = 8.0,
+    rank_decay: float = 0.5,
+) -> float:
+    """Aggregate above-floor rationale scores with geometric rank-decay diminishing returns."""
+    valid_scores = sorted(
+        (float(s.bm25_score) for s in snippets if float(s.bm25_score) >= snippet_floor),
+        reverse=True,
+    )
+    if not valid_scores:
+        return 0.0
+    return float(
+        sum(score * (rank_decay ** rank_idx) for rank_idx, score in enumerate(valid_scores))
+    )
+
+
+def _symmetric_evidence_strength(
+    hyp: MechanisticHypothesis,
+    *,
+    snippet_floor: float = 8.0,
+) -> float:
+    """Compute stance-symmetric evidence score gating sub-threshold snippet flooding."""
+    sup = _saturated_pool_score(hyp.support_evidence, snippet_floor=snippet_floor)
+    con = _saturated_pool_score(hyp.contradict_evidence, snippet_floor=snippet_floor)
     return sup - 0.85 * con
 
 
@@ -93,16 +145,19 @@ def run_elo_hypothesis_tournament(
     k_factor: float = 32.0,
     n_rounds: int = 4,
     debate_scale: float = 12.0,
+    *,
+    snippet_floor: float = 8.0,
 ) -> dict[str, float]:
     """Update Elo ratings across deterministic round-robin symmetric evidence debates."""
-    if not hypotheses:
-        raise ValueError("hypotheses must be non-empty")
+    ordered_ids = _validate_unique_hypotheses(hypotheses)
     if k_factor <= 0.0 or n_rounds < 1 or debate_scale <= 0.0:
         raise ValueError("k_factor, n_rounds, and debate_scale must be positive")
 
     ratings = {h.hypothesis_id: float(h.initial_elo) for h in hypotheses}
-    strengths = {h.hypothesis_id: _symmetric_evidence_strength(h) for h in hypotheses}
-    ordered_ids = [h.hypothesis_id for h in hypotheses]
+    strengths = {
+        h.hypothesis_id: _symmetric_evidence_strength(h, snippet_floor=snippet_floor)
+        for h in hypotheses
+    }
 
     for _ in range(n_rounds):
         deltas = {hid: 0.0 for hid in ordered_ids}
@@ -143,8 +198,12 @@ def compute_perturbation_evsi(
     Uses exact pre-posterior Bayes decision value:
         EVSI(e) = V * (sum_y max_h P(h, Y=y | e) - max_h P(h)) >= 0.
     """
-    if decision_value_usd <= 0.0:
-        raise ValueError("decision_value_usd must be positive")
+    if decision_value_usd <= 0.0 or not math.isfinite(decision_value_usd):
+        raise ValueError("decision_value_usd must be finite and positive")
+    if not priors:
+        raise ValueError("priors must be non-empty")
+    _validate_perturbation_likelihood_keys(list(priors.keys()), perturbation)
+
     prior_sum = sum(priors.values())
     if prior_sum <= 0.0:
         raise ValueError("priors must sum to a positive value")
@@ -197,10 +256,12 @@ def synthesize_crux_experiment(
     deadlock_elo_margin: float = 75.0,
     decision_value_usd: float = 1000.0,
     min_evsi_usd: float = 1.0,
+    min_net_evsi_usd: float = 0.0,
 ) -> CruxSelectionResult:
-    """Run Elo debate and synthesize the highest net-EVSI discriminating crux experiment."""
-    if not hypotheses:
-        raise ValueError("hypotheses must be non-empty")
+    """Run Elo debate and synthesize the highest positive net-EVSI discriminating crux experiment."""
+    ordered_ids = _validate_unique_hypotheses(hypotheses)
+    for cand in candidates:
+        _validate_perturbation_likelihood_keys(ordered_ids, cand)
 
     all_scores = [
         s.bm25_score
@@ -223,13 +284,25 @@ def synthesize_crux_experiment(
             top_pair=None,
         )
 
-    elo_ratings = run_elo_hypothesis_tournament(hypotheses)
+    elo_ratings = run_elo_hypothesis_tournament(
+        hypotheses, snippet_floor=noinfo_threshold
+    )
     priors = elo_to_prior(elo_ratings)
     ranked_hyps = sorted(elo_ratings.items(), key=lambda kv: kv[1], reverse=True)
     top_pair = (ranked_hyps[0][0], ranked_hyps[1][0]) if len(ranked_hyps) >= 2 else None
 
-    total_sup = sum(len(h.support_evidence) for h in hypotheses)
-    total_con = sum(len(h.contradict_evidence) for h in hypotheses)
+    total_sup = sum(
+        1
+        for h in hypotheses
+        for s in h.support_evidence
+        if s.bm25_score >= noinfo_threshold
+    )
+    total_con = sum(
+        1
+        for h in hypotheses
+        for s in h.contradict_evidence
+        if s.bm25_score >= noinfo_threshold
+    )
     close_elo = (
         (ranked_hyps[0][1] - ranked_hyps[1][1]) <= deadlock_elo_margin
         if len(ranked_hyps) >= 2
@@ -245,6 +318,9 @@ def synthesize_crux_experiment(
             priors, cand, decision_value_usd=decision_value_usd
         )
         if evsi_usd < min_evsi_usd:
+            continue
+        # Never pick value-destroying or zero-surplus assays (net_evsi_usd <= 0.0)
+        if net_evsi_usd <= 0.0 or net_evsi_usd < min_net_evsi_usd:
             continue
         if (net_evsi_usd, mi_bits) > (best_metrics[1], best_metrics[2]):
             best_cand = cand
@@ -294,6 +370,7 @@ def _bayes_update_posterior(
     observed_positive: bool,
 ) -> dict[str, float]:
     """Apply Bayes' rule after observing a binary wet-lab perturbation readout."""
+    _validate_perturbation_likelihood_keys(list(priors.keys()), perturbation)
     unnorm: dict[str, float] = {}
     for hid, p_h in priors.items():
         theta = float(perturbation.likelihood_positive_by_hypothesis[hid])
@@ -392,9 +469,6 @@ def run_benchmark(n_scenarios: int = 40, seed: int = 42) -> dict[str, object]:
             ),
         )
 
-        # Candidate wet-lab perturbations:
-        # E_confirm_1 & E_confirm_2 share high lexical BM25 overlap with H1/H2 abstracts
-        # (e.g., repeating standard IC50 / thermal shift) where both H1 and H2 predict ~0.88!
         p_shared = float(rng.uniform(0.84, 0.91))
         candidates = (
             CandidatePerturbation(
