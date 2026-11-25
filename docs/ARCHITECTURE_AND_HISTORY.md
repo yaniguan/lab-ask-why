@@ -46,12 +46,32 @@ Within the [Auto-Lab](https://github.com/yaniguan/auto-lab) Brain/Body architect
 - **Rationale Structure Nuance**: Among the `209` dev `(claim, doc_id)` pairs, `85` contain multiple independent minimal rationale sets (`len(sets) > 1`) and `25` individual rationale sets require multi-sentence conjunctions (`len(s["sentences"]) > 1`). `build_pairs` unions `s["sentences"]` across all sets for a `(claim, doc_id)` pair into a single `gold` index set.
 - **Reference Output (`demo/output.txt`)**: Checked-in 38-line deterministic stdout capture (`2026-11-18`, Linux CPU).
 
+### Open-Source Dataset Registry & Schema Adapters (`src/lab_ask_why/datasets.py`, 2019–2026)
+In addition to the default SciFact benchmark, `src/lab_ask_why/datasets.py` (`OPEN_DATASET_REGISTRY`) and `scripts/fetch_open_datasets.py` provide typed `OpenDatasetSpec` metadata, SPDX / `commercial_use_ok` / `eval_only` guards (`enforce_dataset_guard`), and deterministic schema adapters (`adapt_record`, `adapt_records`) normalizing `14` open-source scientific claim verification, conflicting-evidence, and literature/protocol QA datasets into `NormalizedClaimRecord(claim, evidence_sentences, label in {'SUPPORT', 'CONTRADICT', 'NOINFO'})` for `BM25` + Socratic `EpistemicProbeResult` probing:
+
+| `dataset_id` | Year | Hub / GitHub ID | SPDX License | `commercial_use_ok` | `eval_only` | Native Schema Normalized to `(claim, evidence_sentences, label)` |
+|---|---:|---|---|---|---|---|
+| `labbench2` | 2026 | [`EdisonScientific/labbench2`](https://huggingface.co/datasets/EdisonScientific/labbench2) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `context` (`litqa3`, `protocolqa2`, `sourcequality`) |
+| `peerqa_xt` | 2026 | [`UKPLab/PeerQA-XT`](https://huggingface.co/datasets/UKPLab/PeerQA-XT) | `CC-BY-NC-SA-4.0` | `False` | `False` | `question` + `answer` (`unanswerable` -> `NOINFO`, grounded answer -> `SUPPORT`) |
+| `sciver` | 2025 | [`chengyewang/SciVer`](https://huggingface.co/datasets/chengyewang/SciVer) | `CC-BY-4.0` | `True` | `False` | `claim`, `origin_statement`, `perturbed_explanation`, `label` (`True`/`Entailed` -> `SUPPORT`, `False`/`Refuted` -> `CONTRADICT`) |
+| `claimcheck` | 2025 | [`JHU-CLSP/CLAIMCHECK`](https://github.com/JHU-CLSP/CLAIMCHECK) | `NOASSERTION` | `False` | `False` | `Target claims`, `Weakness span`, `weakness_type` (`contradictory` -> `CONTRADICT`, `insufficient` -> `NOINFO`) |
+| `chembench` | 2025 | [`jablonkagroup/ChemBench`](https://huggingface.co/datasets/jablonkagroup/ChemBench) | `MIT` | `True` | **`True`** | `examples[0].input`, `target`/`target_scores` JSON, `description` (BIG-bench canary guarded) |
+| `litqa2` | 2024 | [`futurehouse/lab-bench`](https://huggingface.co/datasets/futurehouse/lab-bench) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `key-passage` (`CANARY_NEEDLES` guarded) |
+| `lab_bench` | 2024 | [`futurehouse/lab-bench`](https://huggingface.co/datasets/futurehouse/lab-bench) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `protocol` (`ProtocolQA` / `SuppQA` / `DbQA`) |
+| `conflictbank` | 2024 | [`Warrieryes/CB_claim_evidence`](https://huggingface.co/datasets/Warrieryes/CB_claim_evidence) | `CC-BY-SA-4.0` | `True` | `False` | `CB_claim_evidence` (`claim`, `evidence`, `category`) & `CB_qa` (`default_claim` + parametric/conflict evidence) |
+| `faitheval_inconsistent` | 2024 | [`Salesforce/FaithEval-inconsistent-v1.0`](https://huggingface.co/datasets/Salesforce/FaithEval-inconsistent-v1.0) | `CC-BY-NC-SA-4.0` | `False` | `False` | `question`, multi-document conflicting `context`, `answers` (`len(answers) >= 2` -> `CONTRADICT`) |
+| `sciriff` | 2024 | [`allenai/SciRIFF`](https://huggingface.co/datasets/allenai/SciRIFF) | `ODC-BY-1.0` | `True` | `False` | `input` context/claim + structured JSON or string `output` verdict |
+| `bioasq` | 2024 | [`rag-datasets/rag-mini-bioasq`](https://huggingface.co/datasets/rag-datasets/rag-mini-bioasq) | `CC-BY-2.5` | `True` | `False` | `question`/`body`, `exact_answer`/`ideal_answer`/`answer`, `snippets`/`passages` |
+| `scifact_open` | 2022 | [`dwadden/scifact-open`](https://github.com/dwadden/scifact-open) | `CC-BY-NC-2.0` | `False` | `False` | Dict-valued `evidence[doc_id]` (`provenance='citation'|'pooling'`, `label`, `sentences`) over S2ORC corpus |
+| `scifact` | 2020 | [`allenai/scifact`](https://huggingface.co/datasets/allenai/scifact) | `CC-BY-NC-2.0` | `False` | `False` | List-valued `evidence[doc_id]` (`sentences`, `label`) + `cited_doc_ids` (`NOINFO`) |
+| `pubmedqa` | 2019 | [`qiaojin/PubMedQA`](https://huggingface.co/datasets/qiaojin/PubMedQA) | `MIT` | `True` | `False` | `question`, `context.contexts`, `final_decision` (`yes` -> `SUPPORT`, `no` -> `CONTRADICT`, `maybe` -> `NOINFO`) |
+
 ### Curated Ecosystem Catalog & Licensing
 `README.md` curates:
-- **3 Core Benchmarks**: `SciFact` (`CC BY-NC 2.0`, **non-commercial**), `SciRIFF` (`Apache-2.0` code; per-dataset data licenses), and `LAB-Bench` (`CC BY-SA 4.0`, shared with `labbench-posttrain`).
+- **14 Open Scientific Benchmarks (`OPEN_DATASET_REGISTRY`)**: Spanning 2019–2026 (`LABBench2`, `PeerQA-XT`, `SciVer`, `CLAIMCHECK`, `ChemBench`, `LitQA2`, `LAB-Bench`, `ConflictBank`, `FaithEval-Inconsistent`, `SciRIFF`, `BioASQ`, `SciFact-Open`, `SciFact`, `PubMedQA`), fetched on demand into gitignored `data/` (`zero redistribution`), with strict `PermissionError` `eval_only` guards preventing `LAB-Bench`, `LitQA2`, `LABBench2`, and `ChemBench` items from entering training, SFT, or RL corpora.
 - **9 Open-Source Co-Scientist / Debate / RAG Repositories**: `stanford-oval/storm`, `SakanaAI/AI-Scientist`, `Future-House/paper-qa`, `ur-whitelab/chemcrow-public`, `Future-House/robin`, `composable-models/llm_multiagent_debate`, `NoviScl/AI-Researcher`, `allenai/scifact`, and `gomesgroup/coscientist`.
 - **13 Foundational & 2026 Papers**: Including *AI Safety via Debate* (`arXiv:1805.00899`), *Co-Scientist* (`arXiv:2502.18864`), *Benchmark Illusion* (`arXiv:2602.11898`), *When Reviews Disagree* (`arXiv:2605.10171`), *Symposium* (`arXiv:2608.19511`), and *ACED-Bench* (`arXiv:2610.14381`).
-- **License Posture**: Repository code is `MIT`; `SciFact` data is explicitly flagged `CC BY-NC 2.0` (research-only, gitignored).
+- **License Posture**: Repository code is `MIT`; non-commercial (`CC-BY-NC-*`) and unasserted (`NOASSERTION`) datasets are flagged `commercial_use_ok=False` and isolated inside gitignored `data/`.
 
 ---
 

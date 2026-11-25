@@ -17,7 +17,8 @@ Epistemic Socratic co-scientist (`L6`) that decomposes scientific disagreements 
 
 ### Data
 - **Active Benchmark (`SciFact`, Wadden et al. 2020)**: Downloaded on demand to gitignored `data/` (`CC BY-NC 2.0`, zero redistribution): `5,183` abstracts (`corpus.jsonl`; mean `9.7`, median `8` sentences/abstract) and `300` dev claims (`claims_dev.jsonl`), of which `188` evidence-bearing claims yield **`209` `(claim, doc_id)` pairs** (`138` `SUPPORT`, `71` `CONTRADICT`; `112` `NOINFO` claims excluded).
-- **Curated Catalog**: Indexes `SciFact`, `SciRIFF`, and `LAB-Bench`, `9` open-source co-scientist / multi-agent debate / RAG repositories, and `13` foundational & 2026 causal-evidence / disagreement papers.
+- **Open-Source Dataset Registry & Schema Adapters (`src/lab_ask_why/datasets.py`, 2019–2026)**: Typed `OpenDatasetSpec` registry and schema normalizers (`NormalizedClaimRecord`: `claim`, `evidence_sentences`, `label` in `SUPPORT`/`CONTRADICT`/`NOINFO`) covering **`14` open-source scientific claim verification, conflicting-evidence, and literature/protocol QA datasets** (`LABBench2`, `PeerQA-XT`, `SciVer`, `CLAIMCHECK`, `ChemBench`, `LitQA2`, `LAB-Bench`, `ConflictBank`, `FaithEval-Inconsistent`, `SciRIFF`, `BioASQ`, `SciFact-Open`, `SciFact`, and `PubMedQA`), with strict `eval_only` canary guards on `LAB-Bench`, `LitQA2`, `LABBench2`, and `ChemBench`.
+- **Curated Catalog**: Indexes `14` open scientific datasets, `9` open-source co-scientist / multi-agent debate / RAG repositories, and `13` foundational & 2026 causal-evidence / disagreement papers.
 
 ### Model
 Zero-parameter indexed Okapi `BM25` sentence and open-corpus ranker ($k_1 = 1.2$, $b = 0.75$, $k_3 = 1.2$) over biomedical-normalized tokens (Greek letters mapped to ASCII names, `+/-` allele markers and decimal/comma numbers preserved, negations `not`/`no`/`neither`/`without` retained) with background-document IDF (`exclude_doc_ids`) and smooth Laplace OOV IDF, benchmarked against `lead-k`, `conclusion-first`, and 20-seed random baselines plus rationale-grounded Socratic `why_questions` and typed `EpistemicProbeResult` JSONL output.
@@ -47,10 +48,13 @@ lab-ask-why/
 │   └── ARCHITECTURE_AND_HISTORY.md   # Deep technical profile (Object, Data, Model, Training, History)
 ├── lean/
 │   └── LabAskWhyLean.lean            # Lean 4 formalization (contested_claim_requires_experiment)
-├── src/lab_ask_why/                  # Installable package (BM25, TwoStageRetriever, EpistemicProbeResult, LAB-Bench)
+├── scripts/
+│   └── fetch_open_datasets.py        # On-demand fetcher & schema normalizer into gitignored data/
+├── src/lab_ask_why/                  # Installable package (BM25, TwoStageRetriever, datasets, LAB-Bench)
 ├── tests/
 │   ├── test_autolab_wire.py          # Wire contract tests (autolab-wire/v1)
 │   ├── test_community_extensions.py  # Crux tournament & precursor deconvolution tests
+│   ├── test_open_datasets_2026.py    # Offline tests for 2019-2026 dataset registry, guards & adapters
 │   └── test_why_probe.py             # Offline pytest regression suite (#1..#22)
 ├── autolab_wire.py                   # 15-repo Auto-Lab L6 wire node (process_packet)
 ├── .gitignore                        # Excludes downloaded CC BY-NC 2.0 SciFact data/ & caches
@@ -65,8 +69,10 @@ lab-ask-why/
 ```bash
 pip install -r requirements.txt -e .
 python demo/why_probe.py
+lab-ask-why --list-datasets
 lab-ask-why --claim "GWAS identifies rare synthetic associations." --offline --json
 lab-ask-why --export-schema epistemic_probe.schema.json
+python scripts/fetch_open_datasets.py --dataset pubmedqa --max-rows 20 --probe
 ```
 
 Output (`demo/output.txt`, CPU only):
@@ -101,13 +107,26 @@ Plain BM25 finds a supporting or contradicting reason in the top 3 for 0.79 of c
 
 ## Datasets
 
-| Dataset | What | License |
-|---|---|---|
-| [SciFact](https://github.com/allenai/scifact) | 1.4k expert claims with rationale sentences | CC BY-NC 2.0 (**non-commercial**) |
-| [SciRIFF](https://github.com/allenai/SciRIFF) | Instruction data for reading scientific papers | Apache-2.0 (code); data see repo |
-| [LAB-Bench](https://huggingface.co/datasets/futurehouse/lab-bench) | Biology research tasks (LitQA, ProtocolQA) | CC BY-SA 4.0 |
+All `14` datasets below are registered in `src/lab_ask_why/datasets.py` (`OPEN_DATASET_REGISTRY`) with typed `OpenDatasetSpec` metadata, SPDX / `commercial_use_ok` / `eval_only` guards, and schema adapters normalizing records (`claim`, `evidence_sentences`, `label` in `SUPPORT` / `CONTRADICT` / `NOINFO`) directly into `lab-ask-why`'s Okapi `BM25` + Socratic `EpistemicProbeResult` pipeline (`lab-ask-why --list-datasets`, `scripts/fetch_open_datasets.py`):
 
-Licenses marked **non-commercial** are fine for research but not for products.
+| Dataset (`dataset_id`) | Year | What | Hub / Repo ID | SPDX License | Commercial OK | Eval Only |
+|---|---:|---|---|---|---|---|
+| [LABBench2 (`labbench2`)](https://huggingface.co/datasets/EdisonScientific/labbench2) | 2026 | ~1,900 biology research tasks (`litqa3`, `protocolqa2`, `sourcequality`, `suppqa2`, `trialqa`; [arXiv:2604.09554](https://arxiv.org/abs/2604.09554)) | `EdisonScientific/labbench2` | `CC-BY-SA-4.0` | Yes | **Yes** (canary-guarded) |
+| [PeerQA-XT (`peerqa_xt`)](https://huggingface.co/datasets/UKPLab/PeerQA-XT) | 2026 | Cross-domain scientific peer-review QA grounded in biomedical & ML full-text papers ([arXiv:2502.13668](https://arxiv.org/abs/2502.13668)) | `UKPLab/PeerQA-XT` | `CC-BY-NC-SA-4.0` | **No** (**non-commercial**) | No |
+| [SciVer (`sciver`)](https://huggingface.co/datasets/chengyewang/SciVer) | 2025 | ACL 2025 multimodal scientific claim verification (3,000 claims across 1,113 papers with rationales; [arXiv:2506.15569](https://arxiv.org/abs/2506.15569)) | `chengyewang/SciVer` | `CC-BY-4.0` | Yes | No |
+| [CLAIMCHECK (`claimcheck`)](https://github.com/JHU-CLSP/CLAIMCHECK) | 2025 | EMNLP 2025 NeurIPS peer-review weakness critiques linked to target paper claims ([arXiv:2503.21717](https://arxiv.org/abs/2503.21717)) | `JHU-CLSP/CLAIMCHECK` | `NOASSERTION` | **No** (unasserted) | No |
+| [ChemBench (`chembench`)](https://huggingface.co/datasets/jablonkagroup/ChemBench) | 2025 | Chemical reasoning, literature & property QA across chemistry subfields ([arXiv:2411.16955](https://arxiv.org/abs/2411.16955)) | `jablonkagroup/ChemBench` | `MIT` | Yes | **Yes** (canary-guarded) |
+| [LitQA2 (`litqa2`)](https://huggingface.co/datasets/futurehouse/lab-bench) | 2024 | Full-text biological literature comprehension & key-passage grounding ([arXiv:2407.10362](https://arxiv.org/abs/2407.10362)) | `futurehouse/lab-bench` | `CC-BY-SA-4.0` | Yes | **Yes** (canary-guarded) |
+| [LAB-Bench (`lab_bench`)](https://huggingface.co/datasets/futurehouse/lab-bench) | 2024 | Wet-lab protocol troubleshooting (`ProtocolQA`), `SuppQA`, and `DbQA` ([arXiv:2407.10362](https://arxiv.org/abs/2407.10362)) | `futurehouse/lab-bench` | `CC-BY-SA-4.0` | Yes | **Yes** (canary-guarded) |
+| [ConflictBank (`conflictbank`)](https://huggingface.co/datasets/Warrieryes/CB_claim_evidence) | 2024 | NeurIPS 2024 parametric vs. contextual knowledge conflicts (misinformation, temporal, semantic; [arXiv:2408.12076](https://arxiv.org/abs/2408.12076)) | `Warrieryes/CB_claim_evidence` | `CC-BY-SA-4.0` | Yes | No |
+| [FaithEval-Inconsistent (`faitheval_inconsistent`)](https://huggingface.co/datasets/Salesforce/FaithEval-inconsistent-v1.0) | 2024 | Multi-document conflicting-context QA & abstention evaluation ([arXiv:2410.03727](https://arxiv.org/abs/2410.03727)) | `Salesforce/FaithEval-inconsistent-v1.0` | `CC-BY-NC-SA-4.0` | **No** (**non-commercial**) | No |
+| [SciRIFF (`sciriff`)](https://huggingface.co/datasets/allenai/SciRIFF) | 2024 | NeurIPS 2024 unified 54-task scientific literature instruction & claim verification corpus ([arXiv:2406.07835](https://arxiv.org/abs/2406.07835)) | `allenai/SciRIFF` | `ODC-BY-1.0` | Yes (see per-task terms) | No |
+| [BioASQ (`bioasq`)](https://huggingface.co/datasets/rag-datasets/rag-mini-bioasq) | 2024 | Biomedical literature QA & PubMed passage retrieval (`rag-mini-bioasq`) | `rag-datasets/rag-mini-bioasq` | `CC-BY-2.5` | Yes | No |
+| [SciFact-Open (`scifact_open`)](https://github.com/dwadden/scifact-open) | 2022 | Open-domain scientific claim verification scaled to 500K S2ORC abstracts ([arXiv:2210.13777](https://arxiv.org/abs/2210.13777)) | `dwadden/scifact-open` | `CC-BY-NC-2.0` | **No** (**non-commercial**) | No |
+| [SciFact (`scifact`)](https://huggingface.co/datasets/allenai/scifact) | 2020 | 1,409 expert biomedical claims with sentence-level `SUPPORT`/`CONTRADICT` rationales ([arXiv:2004.14974](https://arxiv.org/abs/2004.14974)) | `allenai/scifact` | `CC-BY-NC-2.0` | **No** (**non-commercial**) | No |
+| [PubMedQA (`pubmedqa`)](https://huggingface.co/datasets/qiaojin/PubMedQA) | 2019 | Biomedical research QA with `yes`/`no`/`maybe` abstract verdicts ([arXiv:1909.06146](https://arxiv.org/abs/1909.06146)) | `qiaojin/PubMedQA` | `MIT` | Yes | No |
+
+Licenses marked **non-commercial** (or `NOASSERTION`) are fine for research evaluation when fetched on demand into gitignored `data/`, and datasets marked **Eval Only** (`LAB-Bench`, `LitQA2`, `LABBench2`, `ChemBench`) enforce `PermissionError` whenever `purpose != "eval"` so benchmark items never enter training, SFT, or RL corpora.
 
 ## Open-source repos
 
