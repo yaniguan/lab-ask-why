@@ -16,6 +16,13 @@ jobs:
         with:
           path: data/data.tar.gz
           key: scifact-data-v1-11c621288d41
+      - name: Install elan and verify Lean 4 proofs
+        shell: bash
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
+          cd lean && lake build
+          rm -rf .lake lake-manifest.json
       - name: Install package and test dependencies
         run: pip install -r requirements.txt -e ".[dev]"
       - name: Run offline unit test suite

@@ -26,5 +26,6 @@ lab-ask-why = "lab_ask_why.cli:main"
 where = ["src"]
 
 [tool.pytest.ini_options]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-q"

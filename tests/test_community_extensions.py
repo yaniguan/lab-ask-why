@@ -176,6 +176,72 @@ def test_validation_guards_for_crux_and_ghost() -> None:
         nnls_solve(np.ones((4, 2)), np.ones(3))
 
 
+def test_issue_26_negative_net_evsi_gate_snippet_flooding_and_id_validation() -> None:
+    h_strong = MechanisticHypothesis(
+        "H1",
+        "Direct mechanism",
+        (EvidenceSnippet("d1", "Direct proof", "SUPPORT", 22.0),),
+        (),
+    )
+    h_noisy = MechanisticHypothesis(
+        "H2",
+        "Weak mentions",
+        tuple(
+            EvidenceSnippet(f"n{i}", "Weak tangential mention", "SUPPORT", 3.0)
+            for i in range(10)
+        ),
+        (),
+    )
+    overpriced = CandidatePerturbation(
+        "E_loss",
+        "Overpriced assay",
+        cost_usd=600.0,
+        likelihood_positive_by_hypothesis={"H1": 0.85, "H2": 0.15},
+    )
+    res = synthesize_crux_experiment(
+        [h_strong, h_noisy], [overpriced], noinfo_threshold=8.0, min_evsi_usd=1.0
+    )
+    assert res.elo_ratings["H1"] > res.elo_ratings["H2"]
+    assert res.status == "NO_DISCRIMINATING_EXPERIMENT"
+    assert res.selected_experiment_id is None
+    assert res.selected_experiment_name is None
+    assert res.net_evsi_usd == 0.0
+
+    # Zero-net-EVSI boundary (cost_usd == evsi_usd == 450.0 on 50/50 prior) must also abstain
+    h_even_a = MechanisticHypothesis(
+        "HA", "Equal A", (EvidenceSnippet("a1", "Proof A", "SUPPORT", 20.0),), ()
+    )
+    h_even_b = MechanisticHypothesis(
+        "HB", "Equal B", (EvidenceSnippet("b1", "Proof B", "SUPPORT", 20.0),), ()
+    )
+    zero_net = CandidatePerturbation(
+        "E_zero_net",
+        "Break-even assay",
+        cost_usd=450.0,
+        likelihood_positive_by_hypothesis={"HA": 0.95, "HB": 0.05},
+    )
+    res_zero = synthesize_crux_experiment(
+        [h_even_a, h_even_b], [zero_net], decision_value_usd=1000.0
+    )
+    assert res_zero.status == "NO_DISCRIMINATING_EXPERIMENT"
+    assert res_zero.selected_experiment_id is None
+
+    # Duplicate hypothesis IDs and missing perturbation likelihood keys raise ValueError
+    with pytest.raises(ValueError, match="Duplicate hypothesis_id"):
+        run_elo_hypothesis_tournament([h_strong, h_strong])
+
+    incomplete_cand = CandidatePerturbation(
+        "E_incomplete",
+        "Missing H2",
+        cost_usd=20.0,
+        likelihood_positive_by_hypothesis={"H1": 0.9},
+    )
+    with pytest.raises(ValueError, match="missing likelihood"):
+        compute_perturbation_evsi({"H1": 0.5, "H2": 0.5}, incomplete_cand)
+    with pytest.raises(ValueError, match="missing likelihood"):
+        synthesize_crux_experiment([h_strong, h_noisy], [incomplete_cand])
+
+
 def test_crux_tournament_benchmark_metrics() -> None:
     summary = run_crux_tournament_benchmark(n_scenarios=40, seed=42)
     assert summary["n_scenarios"] == 40
@@ -236,6 +302,44 @@ def test_nnls_and_precursor_ghost_guard_outcomes() -> None:
     res_neg = deconvolve_precursor_ghosts(obs_neg, [p1, p2], t_novel)
     assert res_neg.attribution_outcome == "certified_negative"
     assert res_neg.admit_to_memory is True
+
+
+def test_issue_26_and_27_scale_invariance_and_ceil_permille_boundaries() -> None:
+    grid = np.linspace(10.0, 80.0, 300)
+    p1 = np.exp(-0.5 * ((grid - 20.0) / 0.35) ** 2)
+    t_base = np.exp(-0.5 * ((grid - 35.0) / 0.35) ** 2)
+    obs_base = 0.04 * p1 + 1.0 * t_base
+
+    baseline = deconvolve_precursor_ghosts(obs_base, [p1], t_base)
+    assert baseline.attribution_outcome == "certified_positive"
+
+    for obs_scale in (1.0, 100.0, 2500.0):
+        for ref_scale in (1.0, 100.0, 1000.0):
+            scaled_res = deconvolve_precursor_ghosts(
+                obs_scale * obs_base,
+                [ref_scale * p1],
+                ref_scale * t_base,
+            )
+            assert scaled_res.attribution_outcome == "certified_positive"
+            assert scaled_res.residual_rwp_permille == baseline.residual_rwp_permille
+            assert (
+                scaled_res.precursor_overlap_permille
+                == baseline.precursor_overlap_permille
+            )
+
+    # Issue #27: continuous spectral residual in (100.0, 100.5] permille must NEVER round down to 100
+    t_unit = np.zeros(100)
+    t_unit[10:20] = 1.0
+    orth_impurity = np.zeros(100)
+    orth_impurity[50:60] = 1.0
+
+    for viol_ratio in (0.1000001, 0.10049, 0.10050):
+        theta = math.asin(viol_ratio)
+        obs = math.cos(theta) * t_unit + math.sin(theta) * orth_impurity
+        res = deconvolve_precursor_ghosts(obs, [], t_unit, max_residual_permille=100)
+        assert res.residual_rwp_permille == 101
+        assert res.attribution_outcome == "ambiguous_characterization"
+        assert res.admit_to_memory is False
 
 
 def test_precursor_ghost_benchmark_metrics() -> None:

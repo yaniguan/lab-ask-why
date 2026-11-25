@@ -1,8 +1,8 @@
 /-!
-# LabAskWhyLean: Formal L6 Epistemic Symmetry, NOINFO Abstention & Characterization Guard
+# LabAskWhyLean: Formal L6 Epistemic Symmetry, Multi-Claim Consistency & Characterization Guard
 
 Self-contained Lean 4 (`v4.36.0`) formalization for `lab-ask-why` (`L6`), synchronized
-with the central 14-repository Auto-Lab Trust Regime (`AutoLabLean`):
+with the central Auto-Lab Trust Regime (`AutoLabLean`):
 
 1. **Symmetric Epistemic Retrieval & Socratic Abstention (`EpistemicProbe`, `checkAskWhy`)**:
    - If maximum retrieval score `< noinfoThreshPermille`, the co-scientist MUST abstain
@@ -11,11 +11,16 @@ with the central 14-repository Auto-Lab Trust Regime (`AutoLabLean`):
    - Whenever both supporting and contradicting evidence exist (`0 < supportHits` and
      `0 < contradictHits`), proposing an action requires an explicit falsifiable
      discriminating experiment (`contested_claim_requires_experiment`).
-2. **Precursor-Overlap Characterization Guard (`AssayTelemetry`, `attributeAssayOutcome`)**:
+2. **Analytical Precursor-Overlap Characterization Guard (`AssayTelemetry`, `attributeAssayOutcome`)**:
    - Separates hardware/control faults (`.executionArtifact`) and analytical
      non-identifiability such as precursor ghost-peak overlap (`.ambiguousCharacterization`)
      from proof-carrying scientific truth (`.certifiedPositive` / `.certifiedNegative`).
-   - Formally guarantees `unidentifiable_spectrum_never_certified`.
+   - Formally guarantees `unidentifiable_spectrum_never_certified` and conservative
+     ceiling permille quantization soundness (`ceil_permille_preserves_violation`).
+3. **Multi-Claim Entailment & Mutual-Exclusion Consistency (`EpistemicGraph`, `checkEpistemicGraph`)**:
+   - Enforces cross-claim mechanistic prerequisite consistency (`entailment_conflict_requires_experiment`)
+     and mutual-exclusion consistency (`mutual_exclusion_conflict_requires_experiment`) across
+     campaign probe graphs even when individual probes appear locally uncontested.
 -/
 namespace LabAskWhyLean
 
@@ -125,6 +130,14 @@ theorem empty_rationale_always_rejected (p : EpistemicProbe)
   have hne := ((checkAskWhy_ok_iff p).mp hok).nonEmptyRationale
   omega
 
+/-- Conservative floor quantization (`num / denom`) never falsely clears `noinfoThreshPermille`
+    when the underlying rational ratio `num / denom` is strictly below `noinfoThreshPermille`. -/
+theorem floor_permille_preserves_abstention (num denom thresh : Nat)
+    (_hdenom : 0 < denom)
+    (hbelow : num < thresh * denom) :
+    num / denom < thresh := by
+  exact Nat.div_lt_of_lt_mul (Nat.mul_comm thresh denom ▸ hbelow)
+
 /-! ## 2. Analytical Precursor-Overlap Characterization Guard (`A-Lab` Safeguard) -/
 
 /-- Post-execution telemetry for diagnostic epistemic attribution. -/
@@ -208,6 +221,20 @@ theorem unidentifiable_spectrum_never_certified (t : AssayTelemetry)
   unfold attributeAssayOutcome
   cases executionClean t <;> simp [hid]
 
+/-- Conservative ceiling permille conversion `(num + denom - 1) / denom` strictly preserves
+    any continuous ceiling violation `maxPermille * denom < num` (e.g., 100.0001 or 100.5 permille),
+    eliminating round-half-to-even boundary soundness holes. -/
+theorem ceil_permille_preserves_violation (num denom maxPermille : Nat)
+    (hdenom : 0 < denom)
+    (hviol : maxPermille * denom < num) :
+    maxPermille < (num + denom - 1) / denom := by
+  have hle : (maxPermille + 1) * denom ≤ num + denom - 1 := by
+    have hmul : (maxPermille + 1) * denom = maxPermille * denom + denom := Nat.succ_mul maxPermille denom
+    omega
+  have hdiv : maxPermille + 1 ≤ (num + denom - 1) / denom :=
+    (Nat.le_div_iff_mul_le hdenom).mpr hle
+  omega
+
 /-- Soundness of proof-carrying negative results. -/
 theorem certified_negative_sound (t : AssayTelemetry)
     (hneg : attributeAssayOutcome t = .certifiedNegative) :
@@ -254,7 +281,193 @@ theorem certified_positive_sound (t : AssayTelemetry)
         have ⟨hr, ho⟩ := of_decide_eq_true hid
         exact ⟨rfl, hr, ho, rfl⟩
 
-/-! ## 3. Compile-Time `#guard` Witnesses -/
+/-! ## 3. Multi-Claim Entailment & Mutual-Exclusion Consistency (`EpistemicGraph`) -/
+
+/-- Directed mechanistic prerequisite edge: `antecedent` entails `consequent`. -/
+structure ImplicationEdge where
+  antecedent : Nat
+  consequent : Nat
+  deriving DecidableEq, Repr
+
+/-- Symmetric mutual-exclusion edge: `claimA` and `claimB` cannot jointly hold. -/
+structure MutualExclusionEdge where
+  claimA : Nat
+  claimB : Nat
+  deriving DecidableEq, Repr
+
+/-- Multi-claim epistemic campaign graph over local probes and cross-claim constraints. -/
+structure EpistemicGraph where
+  probes       : List EpistemicProbe
+  implications : List ImplicationEdge
+  exclusions   : List MutualExclusionEdge := []
+  deriving DecidableEq, Repr
+
+/-- Total zero-indexed lookup avoiding standard-library version-specific indexing syntax. -/
+def probeAt? : List EpistemicProbe → Nat → Option EpistemicProbe
+  | [], _ => none
+  | p :: _, 0 => some p
+  | _ :: ps, n + 1 => probeAt? ps n
+
+/-- Sequential validation of any list of items via a violation checker. -/
+def firstMapViolation {α : Type} (f : α → Option RegimeViolation) : List α → Option RegimeViolation
+  | [] => none
+  | x :: xs =>
+    match f x with
+    | some v => some v
+    | none => firstMapViolation f xs
+
+theorem firstMapViolation_none_iff {α : Type} (f : α → Option RegimeViolation) (xs : List α) :
+    firstMapViolation f xs = none ↔ ∀ x ∈ xs, f x = none := by
+  induction xs with
+  | nil => simp [firstMapViolation]
+  | cons hd tl ih =>
+    unfold firstMapViolation
+    cases h : f hd with
+    | some v =>
+      constructor
+      · intro hnone
+        contradiction
+      · intro hall
+        have hhd := hall hd List.mem_cons_self
+        rw [h] at hhd
+        contradiction
+    | none =>
+      constructor
+      · intro htl x hx
+        rcases List.mem_cons.mp hx with rfl | hmem
+        · exact h
+        · exact (ih.mp htl) x hmem
+      · intro hall
+        exact ih.mpr (fun x hx => hall x (List.mem_cons_of_mem hd hx))
+
+/-- Check a single implication edge `antecedent -> consequent` against `probes`. -/
+def checkImplicationEdge (probes : List EpistemicProbe) (e : ImplicationEdge) : Option RegimeViolation :=
+  match probeAt? probes e.antecedent, probeAt? probes e.consequent with
+  | some pA, some pB =>
+    if decide (¬(0 < pA.supportHits ∧ 0 < pB.contradictHits) ∨ pA.hasDiscriminatingExperiment = true) then
+      none
+    else
+      some { repo := "lab-ask-why",
+             rule := "entailment_conflict_requires_experiment",
+             detail := "supported claim entails a contradicted prerequisite without a discriminating experiment" }
+  | _, _ =>
+    some { repo := "lab-ask-why",
+           rule := "implication_index_bounds",
+           detail := "implication edge index out of bounds for probe graph" }
+
+/-- Check a single mutual-exclusion edge `(claimA, claimB)` against `probes`. -/
+def checkExclusionEdge (probes : List EpistemicProbe) (mx : MutualExclusionEdge) : Option RegimeViolation :=
+  match probeAt? probes mx.claimA, probeAt? probes mx.claimB with
+  | some pA, some pB =>
+    if decide (¬(0 < pA.supportHits ∧ 0 < pB.supportHits) ∨
+               (pA.hasDiscriminatingExperiment = true ∧ pB.hasDiscriminatingExperiment = true)) then
+      none
+    else
+      some { repo := "lab-ask-why",
+             rule := "mutual_exclusion_conflict_requires_experiment",
+             detail := "mutually exclusive claims both carry supporting evidence without discriminating experiments" }
+  | _, _ =>
+    some { repo := "lab-ask-why",
+           rule := "exclusion_index_bounds",
+           detail := "mutual-exclusion edge index out of bounds for probe graph" }
+
+/-- Decidable multi-claim guardrail checker over an entire `EpistemicGraph`. -/
+def checkEpistemicGraph (g : EpistemicGraph) : Option RegimeViolation :=
+  match firstMapViolation checkAskWhy g.probes with
+  | some v => some v
+  | none =>
+    match firstMapViolation (checkImplicationEdge g.probes) g.implications with
+    | some v => some v
+    | none => firstMapViolation (checkExclusionEdge g.probes) g.exclusions
+
+/-- Decomposition lemma for `checkEpistemicGraph = none`. -/
+theorem checkEpistemicGraph_none_iff (g : EpistemicGraph) :
+    checkEpistemicGraph g = none ↔
+      (∀ p ∈ g.probes, checkAskWhy p = none) ∧
+      (∀ e ∈ g.implications, checkImplicationEdge g.probes e = none) ∧
+      (∀ mx ∈ g.exclusions, checkExclusionEdge g.probes mx = none) := by
+  unfold checkEpistemicGraph
+  cases hp : firstMapViolation checkAskWhy g.probes with
+  | some v =>
+    constructor
+    · intro hnone
+      contradiction
+    · rintro ⟨hp_all, _, _⟩
+      have hnone := (firstMapViolation_none_iff checkAskWhy g.probes).mpr hp_all
+      rw [hp] at hnone
+      contradiction
+  | none =>
+    have hp_all := (firstMapViolation_none_iff checkAskWhy g.probes).mp hp
+    cases hi : firstMapViolation (checkImplicationEdge g.probes) g.implications with
+    | some v =>
+      constructor
+      · intro hnone
+        contradiction
+      · rintro ⟨_, hi_all, _⟩
+        have hnone := (firstMapViolation_none_iff (checkImplicationEdge g.probes) g.implications).mpr hi_all
+        rw [hi] at hnone
+        contradiction
+    | none =>
+      have hi_all := (firstMapViolation_none_iff (checkImplicationEdge g.probes) g.implications).mp hi
+      constructor
+      · intro hx
+        exact ⟨hp_all, hi_all, (firstMapViolation_none_iff (checkExclusionEdge g.probes) g.exclusions).mp hx⟩
+      · rintro ⟨_, _, hx_all⟩
+        exact (firstMapViolation_none_iff (checkExclusionEdge g.probes) g.exclusions).mpr hx_all
+
+/-- Multi-claim entailment theorem: if claim `A` entails prerequisite `B`, `A` has supporting
+    evidence, and `B` has contradicting evidence, a valid campaign MUST attach a discriminating
+    experiment to `A` even if neither `A` nor `B` is locally contested on its own. -/
+theorem entailment_conflict_requires_experiment (g : EpistemicGraph) (e : ImplicationEdge)
+    (pA pB : EpistemicProbe)
+    (hok : checkEpistemicGraph g = none)
+    (he : e ∈ g.implications)
+    (hA : probeAt? g.probes e.antecedent = some pA)
+    (hB : probeAt? g.probes e.consequent = some pB)
+    (hsup : 0 < pA.supportHits)
+    (hcon : 0 < pB.contradictHits) :
+    pA.hasDiscriminatingExperiment = true := by
+  have ⟨_, himp, _⟩ := (checkEpistemicGraph_none_iff g).mp hok
+  have hedge := himp e he
+  unfold checkImplicationEdge at hedge
+  rw [hA, hB] at hedge
+  simp at hedge
+  exact hedge (by omega) (by omega)
+
+/-- Contrapositive rejection corollary for untested entailment conflicts. -/
+theorem entailment_conflict_without_experiment_rejected (g : EpistemicGraph) (e : ImplicationEdge)
+    (pA pB : EpistemicProbe)
+    (he : e ∈ g.implications)
+    (hA : probeAt? g.probes e.antecedent = some pA)
+    (hB : probeAt? g.probes e.consequent = some pB)
+    (hsup : 0 < pA.supportHits)
+    (hcon : 0 < pB.contradictHits)
+    (hnoexp : pA.hasDiscriminatingExperiment = false) :
+    checkEpistemicGraph g ≠ none := by
+  intro hok
+  have hexp := entailment_conflict_requires_experiment g e pA pB hok he hA hB hsup hcon
+  rw [hnoexp] at hexp
+  contradiction
+
+/-- Multi-claim mutual-exclusion theorem: if mutually exclusive claims `A` and `B` both have
+    supporting evidence in a valid campaign, both must carry discriminating experiments. -/
+theorem mutual_exclusion_conflict_requires_experiment (g : EpistemicGraph) (mx : MutualExclusionEdge)
+    (pA pB : EpistemicProbe)
+    (hok : checkEpistemicGraph g = none)
+    (hmx : mx ∈ g.exclusions)
+    (hA : probeAt? g.probes mx.claimA = some pA)
+    (hB : probeAt? g.probes mx.claimB = some pB)
+    (hsupA : 0 < pA.supportHits)
+    (hsupB : 0 < pB.supportHits) :
+    pA.hasDiscriminatingExperiment = true ∧ pB.hasDiscriminatingExperiment = true := by
+  have ⟨_, _, hexc⟩ := (checkEpistemicGraph_none_iff g).mp hok
+  have hedge := hexc mx hmx
+  unfold checkExclusionEdge at hedge
+  rw [hA, hB] at hedge
+  simp at hedge
+  exact hedge (by omega) (by omega)
+
+/-! ## 4. Compile-Time `#guard` Witnesses -/
 
 #guard (checkAskWhy
          { topScorePermille := 789, noinfoThreshPermille := 350,
@@ -272,6 +485,33 @@ theorem certified_positive_sound (t : AssayTelemetry)
          { topScorePermille := 220, noinfoThreshPermille := 350,
            supportHits := 1, contradictHits := 0,
            hasDiscriminatingExperiment := false }).isSome == true
+
+-- Multi-claim prerequisite conflict witness: each local probe passes `checkAskWhy` individually,
+-- yet `checkEpistemicGraph` catches the contradicted prerequisite unless an experiment is attached.
+def aspirinParentProbe : EpistemicProbe :=
+  { topScorePermille := 820, noinfoThreshPermille := 350,
+    supportHits := 2, contradictHits := 0,
+    hasDiscriminatingExperiment := false }
+
+def aspirinPrerequisiteProbe : EpistemicProbe :=
+  { topScorePermille := 790, noinfoThreshPermille := 350,
+    supportHits := 0, contradictHits := 2,
+    hasDiscriminatingExperiment := false }
+
+#guard (checkAskWhy aspirinParentProbe).isNone == true
+#guard (checkAskWhy aspirinPrerequisiteProbe).isNone == true
+
+#guard checkEpistemicGraph
+         { probes := [aspirinParentProbe, aspirinPrerequisiteProbe],
+           implications := [{ antecedent := 0, consequent := 1 }] }
+       == some { repo := "lab-ask-why",
+                 rule := "entailment_conflict_requires_experiment",
+                 detail := "supported claim entails a contradicted prerequisite without a discriminating experiment" }
+
+#guard (checkEpistemicGraph
+         { probes := [{ aspirinParentProbe with hasDiscriminatingExperiment := true },
+                      aspirinPrerequisiteProbe],
+           implications := [{ antecedent := 0, consequent := 1 }] }).isNone == true
 
 #guard attributeAssayOutcome
          { preGateCertified := true, acousticNormal := false, scheduleWindowsRespected := true,

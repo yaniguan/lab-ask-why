@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-# Negation tokens ('not', 'no', 'neither', 'without', 'never', 'none') are
+# Negation tokens ('not', 'no', 'neither', 'without', 'never', 'none', 'cannot') are
 # deliberately excluded from STOP so opposing scientific stances retain negation cues.
 STOP = frozenset(
     "a an the of in on to for and or is are was were be by with as at from "
@@ -20,6 +20,8 @@ GREEK_MAP: dict[str, str] = {
     "\u03b2": "beta",    # β
     "\u03b3": "gamma",   # γ
     "\u03b4": "delta",   # δ
+    "\u0394": "delta",   # Δ (Greek capital delta allele/deletion marker)
+    "\u2206": "delta",   # ∆ (Unicode increment deletion symbol)
     "\u03b5": "epsilon", # ε
     "\u03b6": "zeta",    # ζ
     "\u03b7": "eta",     # η
@@ -42,14 +44,40 @@ GREEK_MAP: dict[str, str] = {
 
 _GREEK_RE = re.compile("|".join(re.escape(k) for k in GREEK_MAP))
 _COMMA_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}\b)")
-_PAREN_PLUS_RE = re.compile(r"\s*\(\+\)")
-_PAREN_MINUS_RE = re.compile(r"\s*\(-\)")
-_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[a-z0-9]+(?:\+|-(?=\s|$))?")
+_UPPER_PREFIX_SYMBOL_RE = re.compile(r"\b(\d+)-(?=[A-Z]{2,}[A-Za-z0-9]*\b)")
+_ALNUM_PREFIX_SYMBOL_RE = re.compile(r"\b(\d+)-(?=[a-z]+\d+[a-z0-9]*\b)")
+
+_CANT_RE = re.compile(r"\bcan['\u2019]t\b")
+_WONT_RE = re.compile(r"\bwon['\u2019]t\b")
+_SHANT_RE = re.compile(r"\bshan['\u2019]t\b")
+_AUX_NT_RE = re.compile(
+    r"\b(doesn|don|didn|isn|aren|wasn|weren|hasn|haven|hadn|couldn|wouldn|shouldn|mustn|needn)['\u2019]t\b"
+)
+
+# Normalize homozygous (+/-) genotype suffixes and parenthesized allele markers before hyphen splitting
+# so 'alpha(-)-thalassaemia', 'CD4-/CD8+', and 'Trp53-/-' retain distinct negative-allele tokens.
+_HOM_POS_RE = re.compile(r"(?<=[a-z0-9])\s*\+/\+\s*-?")
+_HOM_NEG_RE = re.compile(r"(?<=[a-z0-9])\s*-/-\s*-?")
+_PAREN_PLUS_RE = re.compile(r"\s*\(\+\)\s*-?")
+_PAREN_MINUS_RE = re.compile(r"\s*\(-\)\s*-?")
+
+# Standalone decimals ('1.1') match first only when a decimal point is present; dotless
+# leading-digit biomedical symbols ('16s', '5ht2a', '293t', '3d') stay intact in branch 2.
+# Trailing '-' is retained unless followed by an alphanumeric compound continuation or '--'.
+_TOKEN_RE = re.compile(r"\d+\.\d+|[a-z0-9]+(?:\+/-|\+|-(?![a-z0-9-]))?")
 
 
 def normalize_biomedical_text(text: str) -> str:
-    """Normalize Greek biomedical symbols, allele (+/-) markers, and numeric commas."""
-    lowered = text.lower()
+    """Normalize Greek biomedical symbols, contractions, allele (+/-) markers, and numeric commas."""
+    pre = _UPPER_PREFIX_SYMBOL_RE.sub(r"\1", text)
+    lowered = pre.lower()
+    lowered = _ALNUM_PREFIX_SYMBOL_RE.sub(r"\1", lowered)
+
+    # Expand negative contractions before punctuation stripping so negation cues are retained.
+    lowered = _CANT_RE.sub("cannot", lowered)
+    lowered = _WONT_RE.sub("will not", lowered)
+    lowered = _SHANT_RE.sub("shall not", lowered)
+    lowered = _AUX_NT_RE.sub(lambda m: f"{m.group(1)[:-1]} not", lowered)
 
     def _replace_greek(match: re.Match[str]) -> str:
         word = GREEK_MAP[match.group(0)]
@@ -59,8 +87,10 @@ def normalize_biomedical_text(text: str) -> str:
         return f"{prefix}{word}{suffix}"
 
     norm = _GREEK_RE.sub(_replace_greek, lowered)
-    norm = _PAREN_PLUS_RE.sub("+", norm)
-    norm = _PAREN_MINUS_RE.sub("-", norm)
+    norm = _HOM_POS_RE.sub("+ ", norm)
+    norm = _HOM_NEG_RE.sub("- ", norm)
+    norm = _PAREN_PLUS_RE.sub("+ ", norm)
+    norm = _PAREN_MINUS_RE.sub("- ", norm)
     while True:
         updated = _COMMA_THOUSANDS_RE.sub("", norm)
         if updated == norm:
@@ -78,7 +108,7 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25:
-    """Indexed Okapi BM25 with query-TF saturation, zero-length guards, and Laplace OOV IDF."""
+    """Indexed Okapi BM25 with query-TF saturation, background IDF scope, and budget normalization."""
 
     def __init__(
         self,
@@ -86,6 +116,8 @@ class BM25:
         k1: float = 1.2,
         b: float = 0.75,
         k3: float = 1.2,
+        *,
+        idf_sentences: Sequence[str] | None = None,
     ) -> None:
         if not sentences:
             raise ValueError("BM25 requires at least one sentence")
@@ -97,31 +129,48 @@ class BM25:
         self.k3 = float(k3)
         self.num_docs = len(sentences)
 
-        df: Counter[str] = Counter()
         lengths = np.empty(self.num_docs, dtype=np.float64)
         raw_postings: dict[str, list[tuple[int, float]]] = defaultdict(list)
+        full_df: Counter[str] = Counter()
 
         for idx, sent in enumerate(sentences):
             toks = tokenize(sent)
             lengths[idx] = float(len(toks))
             tf = Counter(toks)
             for term, count in tf.items():
-                df[term] += 1
+                full_df[term] += 1
                 raw_postings[term].append((idx, float(count)))
 
+        if idf_sentences is not None:
+            if not idf_sentences:
+                raise ValueError("idf_sentences must be non-empty when provided")
+            bg_df: Counter[str] = Counter()
+            bg_lengths = np.empty(len(idf_sentences), dtype=np.float64)
+            for idx, sent in enumerate(idf_sentences):
+                toks = tokenize(sent)
+                bg_lengths[idx] = float(len(toks))
+                for term in set(toks):
+                    bg_df[term] += 1
+            idf_n = float(len(idf_sentences))
+            mean_len = float(np.mean(bg_lengths))
+            active_df = bg_df
+        else:
+            idf_n = float(self.num_docs)
+            mean_len = float(np.mean(lengths)) if self.num_docs > 0 else 1.0
+            active_df = full_df
+
         # Clamp avgdl >= 1.0 so stopword-only / blank sentence lists never divide by zero.
-        mean_len = float(np.mean(lengths)) if self.num_docs > 0 else 1.0
         self.avgdl = max(mean_len, 1.0)
         self.doc_len = lengths
         self.norm = self.k1 * (1.0 - self.b + self.b * (self.doc_len / self.avgdl))
+        self.idf_num_docs = int(idf_n)
 
-        n = float(self.num_docs)
         self.idf: dict[str, float] = {
-            term: math.log(1.0 + (n - d + 0.5) / (d + 0.5))
-            for term, d in df.items()
+            term: math.log(1.0 + (idf_n - d + 0.5) / (d + 0.5))
+            for term, d in active_df.items()
         }
         # Smooth Laplace IDF for OOV query terms (d = 0) when BM25 is fit on background docs.
-        self.default_idf: float = math.log(1.0 + (n + 0.5) / 0.5)
+        self.default_idf: float = math.log(1.0 + (idf_n + 0.5) / 0.5)
 
         # Compact inverted index for fast full-corpus and subset retrieval without re-tokenizing.
         self.postings: dict[str, tuple[np.ndarray, np.ndarray]] = {
@@ -171,6 +220,15 @@ class BM25:
             term: ((self.k3 + 1.0) * count) / (self.k3 + count)
             for term, count in q_tf.items()
         }
+
+    def query_budget(self, query: str) -> float:
+        """Theoretical reference self-match BM25 budget `sum_{t in q} w_q(t) * idf(t)`."""
+        q_weights = self._query_weights(query)
+        if not q_weights:
+            return 0.0
+        return float(
+            sum(qw * self.idf.get(term, self.default_idf) for term, qw in q_weights.items())
+        )
 
     def score_indexed(
         self,
@@ -232,6 +290,83 @@ class BM25:
                     )
         return out
 
+    def score_indexed_normalized(
+        self,
+        query: str,
+        sent_ids: Sequence[int] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Corpus-size and query-length invariant score in [0, 1] combining budget & coverage."""
+        q_weights = self._query_weights(query)
+        n_target = self.num_docs if sent_ids is None else len(sent_ids)
+        if n_target == 0 or not q_weights:
+            return np.zeros(n_target, dtype=np.float64)
+
+        budget = sum(qw * self.idf.get(term, self.default_idf) for term, qw in q_weights.items())
+        if budget <= 0.0:
+            return np.zeros(n_target, dtype=np.float64)
+
+        raw = self.score_indexed(query, sent_ids)
+        n_q = float(len(q_weights))
+        matched_count = np.zeros(n_target, dtype=np.float64)
+        matched_idf = np.zeros(n_target, dtype=np.float64)
+        oov_set = {t for t in q_weights if t not in self.idf}
+        matched_oov = np.zeros(n_target, dtype=np.float64)
+
+        idx_arr = None if sent_ids is None else np.asarray(sent_ids, dtype=np.int32)
+        is_contiguous = (
+            idx_arr is not None
+            and (idx_arr.size == 1 or bool(np.all(np.diff(idx_arr) == 1)))
+        )
+        start = int(idx_arr[0]) if idx_arr is not None and idx_arr.size > 0 else 0
+        end = start + (int(idx_arr.size) if idx_arr is not None else 0)
+
+        for term, qw in q_weights.items():
+            posting = self.postings.get(term)
+            if posting is None:
+                continue
+            doc_idx, _ = posting
+            term_budget = qw * self.idf.get(term, self.default_idf)
+            if idx_arr is None:
+                matched_count[doc_idx] += 1.0
+                matched_idf[doc_idx] += term_budget
+                if term in oov_set:
+                    matched_oov[doc_idx] += 1.0
+            elif is_contiguous:
+                lo = int(np.searchsorted(doc_idx, start, side="left"))
+                hi = int(np.searchsorted(doc_idx, end, side="left"))
+                if lo < hi:
+                    locs = doc_idx[lo:hi] - start
+                    matched_count[locs] += 1.0
+                    matched_idf[locs] += term_budget
+                    if term in oov_set:
+                        matched_oov[locs] += 1.0
+            else:
+                pos = np.searchsorted(doc_idx, idx_arr)
+                valid = (pos < doc_idx.size) & (doc_idx[np.minimum(pos, doc_idx.size - 1)] == idx_arr)
+                if np.any(valid):
+                    matched_count[valid] += 1.0
+                    matched_idf[valid] += term_budget
+                    if term in oov_set:
+                        matched_oov[valid] += 1.0
+
+        budget_ratio = np.minimum(1.0, raw / budget)
+        tok_cov = matched_count / n_q
+        idf_cov = np.minimum(1.0, matched_idf / budget)
+        cov_factor = 0.5 * tok_cov + 0.5 * idf_cov
+
+        unmatched_oov = np.maximum(0.0, float(len(oov_set)) - matched_oov)
+        apply_oov_pen = (self.idf_num_docs >= 10) and (len(oov_set) >= 2)
+        oov_penalty = (
+            np.where(
+                unmatched_oov >= 2.0,
+                np.square(np.maximum(0.0, 1.0 - unmatched_oov / n_q)),
+                1.0,
+            )
+            if apply_oov_pen
+            else 1.0
+        )
+        return np.clip(budget_ratio * cov_factor * oov_penalty, 0.0, 1.0)
+
     def scores(self, query: str, sentences: Sequence[str]) -> np.ndarray:
         """Score arbitrary candidate sentences (supports unindexed or background-excluded docs)."""
         n_cand = len(sentences)
@@ -255,6 +390,43 @@ class BM25:
                     idf = self.idf.get(term, self.default_idf)
                     score += qw * idf * t_count * (self.k1 + 1.0) / (t_count + norm)
             out[i] = score
+        return out
+
+    def normalized_scores(self, query: str, sentences: Sequence[str]) -> np.ndarray:
+        """Corpus-size and query-length invariant score in [0, 1] for arbitrary sentences."""
+        n_cand = len(sentences)
+        if n_cand == 0:
+            return np.zeros(0, dtype=np.float64)
+        q_weights = self._query_weights(query)
+        if not q_weights:
+            return np.zeros(n_cand, dtype=np.float64)
+        budget = sum(qw * self.idf.get(term, self.default_idf) for term, qw in q_weights.items())
+        if budget <= 0.0:
+            return np.zeros(n_cand, dtype=np.float64)
+
+        raw = self.scores(query, sentences)
+        n_q = float(len(q_weights))
+        oov_set = {t for t in q_weights if t not in self.idf}
+        out = np.zeros(n_cand, dtype=np.float64)
+
+        for i, sent in enumerate(sentences):
+            if raw[i] <= 0.0:
+                continue
+            s_toks = set(tokenize(sent))
+            matched_q = [t for t in q_weights if t in s_toks]
+            tok_cov = len(matched_q) / n_q
+            idf_cov = min(
+                1.0,
+                sum(q_weights[t] * self.idf.get(t, self.default_idf) for t in matched_q) / budget,
+            )
+            unmatched_oov = len(oov_set - s_toks)
+            oov_pen = (
+                ((1.0 - unmatched_oov / n_q) ** 2)
+                if (self.idf_num_docs >= 10 and unmatched_oov >= 2)
+                else 1.0
+            )
+            budget_ratio = min(1.0, float(raw[i]) / budget)
+            out[i] = min(1.0, max(0.0, budget_ratio * (0.5 * tok_cov + 0.5 * idf_cov) * oov_pen))
         return out
 
     def rank_candidates(

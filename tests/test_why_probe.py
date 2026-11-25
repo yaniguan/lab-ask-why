@@ -16,13 +16,17 @@ import pytest
 from lab_ask_why import (
     BM25,
     CANARY_NEEDLES,
+    CONTROL_WELL_ROLES,
     EPISTEMIC_PROBE_JSON_SCHEMA,
     STOP,
+    ControlWellSpec,
     CounterfactualProbeScorer,
     EpistemicProbeResult,
     TwoStageRetriever,
     build_noinfo_pairs,
     build_pairs,
+    check_ask_why_permille,
+    check_epistemic_graph_permille,
     classify_rationale_polarity,
     compute_auroc,
     conclusion_first_rankings,
@@ -39,6 +43,9 @@ from lab_ask_why import (
     recall_at,
     safe_extract_tar,
     sentence_recall_at,
+    synthesize_control_wells,
+    to_permille_ceil,
+    to_permille_floor,
     tokenize,
     why_questions,
 )
@@ -424,3 +431,283 @@ def test_issue_22_labbench_protocolqa_adapter_canary_guard_and_counterfactual_sc
     }
     pkt = CounterfactualProbeScorer(threshold=0.70).score_pair(items[0], cf_item)
     assert pkt.shifted_rationale is True and pkt.consistency == pytest.approx(1.0)
+
+
+def test_issue_24_tokenizer_alleles_delta_alphanumeric_and_scoped_polarity() -> None:
+    assert tokenize("alpha(+)-thalassaemia") == ["alpha+", "thalassaemia"]
+    assert tokenize("alpha(-)-thalassaemia") == ["alpha-", "thalassaemia"]
+    assert tokenize("CD4-/CD8+") == ["cd4-", "cd8+"]
+    assert tokenize("Trp53-/- Trp53+/+ Trp53+/-") == ["trp53-", "trp53+", "trp53+/-"]
+    assert tokenize("\u0394F508 rad52\u2206") == ["delta", "f508", "rad52", "delta"]
+    assert tokenize("16S rRNA 5-HT2A 293T 3D 1.1") == [
+        "16s",
+        "rrna",
+        "5ht2a",
+        "293t",
+        "3d",
+        "1.1",
+    ]
+    assert tokenize("genome-wide double-strand") == ["genome", "wide", "double", "strand"]
+
+    assert (
+        classify_rationale_polarity(
+            "Aspirin prevents ester hydrolysis.",
+            "Aspirin cannot prevent ester hydrolysis.",
+        )
+        == "CONTRADICT"
+    )
+    assert (
+        classify_rationale_polarity(
+            "Aspirin prevents ester hydrolysis.",
+            "Aspirin doesn't prevent ester hydrolysis.",
+        )
+        == "CONTRADICT"
+    )
+    assert (
+        classify_rationale_polarity(
+            "Distal 5-prime mismatches are tolerated.",
+            "Distal 5-prime mismatches are tolerated without eliminating double-strand breaks.",
+        )
+        == "SUPPORT"
+    )
+    assert (
+        classify_rationale_polarity(
+            "Drug X increases survival.",
+            "Drug X increases survival with no dose-limiting toxicity.",
+        )
+        == "SUPPORT"
+    )
+    assert (
+        classify_rationale_polarity(
+            "Drug X increases survival.",
+            "Although early trials claimed Drug X increases survival, randomized cohorts show Drug X decreases survival.",
+        )
+        == "CONTRADICT"
+    )
+    assert (
+        classify_rationale_polarity(
+            "Quantum Hall conductance plateau in graphene.",
+            "PCR Taq polymerase denatures at 98 C.",
+        )
+        == "NEUTRAL"
+    )
+
+    # NEUTRAL NLI/reranker rationales must never populate supporting_rationales
+    neutral_corpus = {
+        1: {"doc_id": 1, "title": "Setup", "abstract": ["Samples were incubated at 37 C."]}
+    }
+    ret_neutral = TwoStageRetriever(
+        neutral_corpus,
+        abstention_threshold=0.05,
+        rerank_fn=lambda _c, sents: [(0.9, "NEUTRAL") for _ in sents],
+    )
+    p_neutral = ret_neutral.probe_claim("Samples incubated at 37 C dissolve.")
+    assert p_neutral.supporting_rationales == []
+    assert p_neutral.contradicting_rationales == []
+    assert p_neutral.epistemic_status == "INSUFFICIENT_EVIDENCE"
+
+
+def test_issue_25_query_budget_scaling_cv_calibration_and_background_idf() -> None:
+    # 1. Small-corpus exact match must resolve as SUPPORTED rather than falsely abstaining
+    small_corpus = {
+        1: {"doc_id": 1, "title": "Autophagy", "abstract": ["Metformin activates hepatic AMPK signaling."]},
+        2: {"doc_id": 2, "title": "Control", "abstract": ["Vehicle saline did not alter weight."]},
+    }
+    ret_small = TwoStageRetriever(small_corpus)
+    probe_exact = ret_small.probe_claim("Metformin activates AMPK.")
+    assert probe_exact.epistemic_status == "SUPPORTED"
+    assert probe_exact.retrieval_confidence >= 0.80
+
+    # 2. High-verbosity NOINFO claim with 0% disease/predicate overlap must abstain
+    large_corpus = {
+        i: {"doc_id": i, "title": f"Doc {i}", "abstract": [f"Background gene_{i} cellular metabolism study."]}
+        for i in range(200)
+    }
+    large_corpus[999] = {
+        "doc_id": 999,
+        "title": "Sleep Perfusion",
+        "abstract": [
+            "Chronic intermittent hypoxia alters renal cortical perfusion in aged Sprague Dawley rats during sleep."
+        ],
+    }
+    ret_large = TwoStageRetriever(large_corpus)
+    probe_noinfo = ret_large.probe_claim(
+        "Chronic intermittent hypoxia cures pancreatic ductal adenocarcinoma in aged Sprague Dawley rats during sleep."
+    )
+    assert probe_noinfo.epistemic_status == "INSUFFICIENT_EVIDENCE"
+    assert probe_noinfo.retrieval_confidence < 0.25
+
+    # 3. Separate fit_abstention_threshold vs non-mutating evaluate_claims
+    cal_claims = [
+        {"id": 1, "claim": "Metformin activates AMPK.", "evidence": {"1": [{"sentences": [0], "label": "SUPPORT"}]}},
+        {"id": 2, "claim": "Unrelated astrophysics supernova emission.", "evidence": {}},
+    ]
+    orig_thresh = ret_small.abstention_threshold
+    _ = ret_small.evaluate_claims(cal_claims)
+    assert ret_small.abstention_threshold == orig_thresh
+    fitted = ret_small.fit_abstention_threshold(cal_claims)
+    assert ret_small.abstention_threshold == pytest.approx(fitted)
+
+    # 4. Background IDF scope excludes evaluation doc vocabulary while keeping docs searchable
+    leak_corpus = {
+        1: {"doc_id": 1, "title": "BG1", "abstract": ["Common kinase signaling regulates growth."]},
+        2: {"doc_id": 2, "title": "BG2", "abstract": ["Common kinase pathway alters metabolism."]},
+        77: {"doc_id": 77, "title": "EvalDoc", "abstract": ["Zyxwvunikin activates autophagic flux."]},
+    }
+    eval_claims = [
+        {
+            "id": 10,
+            "claim": "Zyxwvunikin activates autophagic flux.",
+            "evidence": {"77": [{"sentences": [0], "label": "SUPPORT"}]},
+            "cited_doc_ids": [77],
+        }
+    ]
+    ret_bg = TwoStageRetriever(leak_corpus, exclude_doc_ids=[77])
+    assert "zyxwvunikin" not in ret_bg.sent_bm25.idf
+    assert "zyxwvunikin" not in ret_bg.doc_bm25.idf
+    found = ret_bg.retrieve("Zyxwvunikin activates autophagic flux.", doc_top_m=2, sent_top_k=1)
+    assert found["top_doc_ids"][0] == 77
+    bench_bg = evaluate_scifact_benchmark(leak_corpus, eval_claims, idf_scope="background")
+    assert bench_bg["open_corpus"]["doc_recall@5"] == pytest.approx(1.0)
+
+
+def test_issue_27_permille_bounds_and_multi_claim_consistency() -> None:
+    assert to_permille_floor(0.349999) == 349
+    assert to_permille_floor(0.3495) == 349
+    assert to_permille_floor(0.35) == 350
+    assert to_permille_floor(0.29) == 290
+
+    assert to_permille_ceil(0.10) == 100
+    assert to_permille_ceil(0.1000001) == 101
+    assert to_permille_ceil(0.1005) == 101
+    assert to_permille_ceil(0.15) == 150
+    assert to_permille_ceil(0.1500001) == 151
+    assert to_permille_ceil(0.1505) == 151
+
+    assert (
+        check_ask_why_permille(0.3495, noinfo_thresh=0.35, support_hits=1, contradict_hits=0)[
+            "rule"
+        ]
+        == "noinfo_abstain"
+    )
+    assert check_ask_why_permille(0.35, noinfo_thresh=0.35, support_hits=1, contradict_hits=0) is None
+
+    # Multi-claim entailment conflict: p_parent supported, p_prereq contradicted, neither locally contested
+    p_parent = {
+        "topScorePermille": 820,
+        "noinfoThreshPermille": 350,
+        "supportHits": 2,
+        "contradictHits": 0,
+        "hasDiscriminatingExperiment": False,
+    }
+    p_prereq = {
+        "topScorePermille": 790,
+        "noinfoThreshPermille": 350,
+        "supportHits": 0,
+        "contradictHits": 2,
+        "hasDiscriminatingExperiment": False,
+    }
+    viol = check_epistemic_graph_permille([p_parent, p_prereq], implications=[(0, 1)])
+    assert viol is not None and viol["rule"] == "entailment_conflict_requires_experiment"
+
+    p_parent_exp = {**p_parent, "hasDiscriminatingExperiment": True}
+    assert check_epistemic_graph_permille([p_parent_exp, p_prereq], implications=[(0, 1)]) is None
+
+    # Mutual exclusion conflict
+    mx_viol = check_epistemic_graph_permille([p_parent, p_parent], exclusions=[(0, 1)])
+    assert mx_viol is not None and mx_viol["rule"] == "mutual_exclusion_conflict_requires_experiment"
+    assert check_epistemic_graph_permille([p_parent_exp, p_parent_exp], exclusions=[(0, 1)]) is None
+
+    lean_src = (REPO_ROOT / "lean" / "LabAskWhyLean.lean").read_text(encoding="utf-8")
+    assert "theorem entailment_conflict_requires_experiment" in lean_src
+    assert "theorem ceil_permille_preserves_violation" in lean_src
+    assert "sorry" not in lean_src
+    wf = (REPO_ROOT / ".github" / "workflows" / "demo.yml").read_text(encoding="utf-8")
+    assert "lake build" in wf
+
+
+def test_issue_29_hybrid_paraphrase_hooks_and_control_well_synthesis() -> None:
+    # 1. Zero-BM25 mechanistic paraphrase recalled via deterministic subword/concept hybrid index
+    synonym_corpus = {
+        1: {
+            "doc_id": 1,
+            "title": "Salicylate Stability",
+            "abstract": [
+                "Aspirin suffers rapid aqueous hydrolysis into salicylate during 37 C incubation."
+            ],
+        }
+    }
+    retriever = TwoStageRetriever(synonym_corpus, abstention_threshold=0.5)
+    probe = retriever.probe_claim(
+        "Acetylsalicylic acid undergoes thermal ester deacetylation in unbuffered water."
+    )
+    assert probe.epistemic_status == "SUPPORTED"
+    assert probe.retrieval_confidence >= 0.5
+
+    # 2. Pluggable embed_fn (RRF) and rerank_fn (NLI stance override)
+    custom_corpus = {
+        1: {"doc_id": 1, "title": "Distractor", "abstract": ["Alpha token superficial mention."]},
+        2: {"doc_id": 2, "title": "DenseHit", "abstract": ["Orthogonal latent mechanism blocks target."]},
+    }
+
+    def _mock_embed(texts: list[str]) -> np.ndarray:
+        out = np.zeros((len(texts), 2), dtype=np.float64)
+        for idx, t in enumerate(texts):
+            if "latent" in t.lower() or "query_latent" in t.lower():
+                out[idx] = [1.0, 0.0]
+            else:
+                out[idx] = [0.0, 1.0]
+        return out
+
+    ret_hooks = TwoStageRetriever(
+        custom_corpus,
+        abstention_threshold=0.2,
+        embed_fn=_mock_embed,
+        rerank_fn=lambda _q, sents: [
+            (0.92, "CONTRADICT") if "latent" in s.lower() else (0.05, "NEUTRAL")
+            for s in sents
+        ],
+    )
+    p_hooks = ret_hooks.probe_claim("query_latent signal increases activity.")
+    assert p_hooks.epistemic_status == "CONTRADICTED"
+    assert len(p_hooks.contradicting_rationales) == 1
+    assert p_hooks.supporting_rationales == []
+
+    # 3. Contested claim synthesizes candidate_descriptors and structured ControlWellSpec panel
+    contested_corpus = {
+        1: {"doc_id": 1, "title": "Support", "abstract": ["Incubation at 37 C increases aspirin solubility."]},
+        2: {"doc_id": 2, "title": "Counter", "abstract": ["Incubation at 37 C without blank controls does not prevent aspirin hydrolysis."]},
+    }
+    contested = TwoStageRetriever(contested_corpus, abstention_threshold=0.1).probe_claim(
+        "Incubation at 37 C increases aspirin solubility."
+    )
+    assert contested.epistemic_status == "CONTESTED"
+    assert contested.discriminating_observable.candidate_descriptors["temp_c"] == 37.0
+    wells = contested.discriminating_observable.control_wells
+    assert len(wells) >= 3
+    roles = {w.role for w in wells}
+    assert "VEHICLE_BLANK" in roles
+    assert "PERTURBATION_ARM" in roles
+    assert roles <= set(CONTROL_WELL_ROLES)
+    jsonschema.validate(instance=contested.to_dict(), schema=EPISTEMIC_PROBE_JSON_SCHEMA)
+
+    # Backward compatibility: payload omitting control_wells still validates and round-trips
+    legacy_dict = contested.to_dict()
+    legacy_dict["discriminating_observable"].pop("control_wells", None)
+    jsonschema.validate(instance=legacy_dict, schema=EPISTEMIC_PROBE_JSON_SCHEMA)
+    assert EpistemicProbeResult.from_dict(legacy_dict).discriminating_observable.control_wells == []
+
+    # Turbidity & denaturation confounder branches in synthesize_control_wells
+    turb_wells = synthesize_control_wells(
+        "Candidate compound dissolves cleanly.",
+        ["turbidity", "colloidal"],
+    )
+    assert any(w.parameters.get("confounder_target") == "turbidity" for w in turb_wells)
+    denat_wells = synthesize_control_wells(
+        "Taq polymerase amplifies target at 95 C.",
+        ["denaturation"],
+    )
+    assert any(w.role == "INACTIVATED_CONTROL" for w in denat_wells)
+    with pytest.raises(ValueError, match="role"):
+        ControlWellSpec("BAD_ROLE", {}, "ok", "fail")
+
