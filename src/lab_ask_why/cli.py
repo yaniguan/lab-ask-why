@@ -21,6 +21,11 @@ from lab_ask_why.data import (
     ensure_data,
     read_jsonl,
 )
+from lab_ask_why.datasets import (
+    format_dataset_registry_table,
+    list_open_datasets,
+    probe_dataset_records,
+)
 from lab_ask_why.labbench_adapter import load_labbench_items, probe_labbench_item
 from lab_ask_why.metrics import (
     compute_auroc,
@@ -326,6 +331,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Evaluate rationale probing on a LAB-Bench LitQA2 or ProtocolQA JSONL file.",
     )
+    parser.add_argument(
+        "--list-datasets",
+        action="store_true",
+        help="List registered 2019-2026 open scientific claim/QA datasets and exit.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Dataset ID/alias when probing raw JSONL records via --dataset-jsonl.",
+    )
+    parser.add_argument(
+        "--dataset-jsonl",
+        type=str,
+        default=None,
+        help="Path to raw JSONL records for --dataset schema normalization and BM25+Socratic probing.",
+    )
+    parser.add_argument(
+        "--purpose",
+        type=str,
+        default="eval",
+        help="Intended usage purpose ('eval' or 'train') enforced against eval_only guards.",
+    )
     return parser
 
 
@@ -377,6 +405,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
+        if args.list_datasets:
+            specs = list_open_datasets()
+            if out_fmt == "json":
+                print(json.dumps([s.to_dict() for s in specs], ensure_ascii=False, indent=2))
+            else:
+                print(format_dataset_registry_table(specs))
+            return 0
+
         if args.export_schema:
             schema = EpistemicProbeResult.json_schema()
             with open(args.export_schema, mode="w", encoding="utf-8") as fh:
@@ -385,6 +421,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(schema, indent=2))
             else:
                 print(f"Wrote EpistemicProbeResult JSON Schema to {args.export_schema}")
+            return 0
+
+        if args.dataset_jsonl:
+            if not args.dataset:
+                raise ValueError("--dataset-jsonl requires --dataset <dataset_id>.")
+            if not os.path.exists(args.dataset_jsonl):
+                raise FileNotFoundError(f"Dataset JSONL file not found: {args.dataset_jsonl}")
+            raw_rows = read_jsonl(args.dataset_jsonl)
+            probes = probe_dataset_records(
+                args.dataset,
+                raw_rows,
+                purpose=args.purpose,
+                top_k=args.top_k,
+            )
+            if args.export_probes:
+                export_probes_jsonl(probes, args.export_probes)
+            payload = {
+                "dataset": args.dataset,
+                "records_probed": len(probes),
+                "probes": [p.to_dict() for p in probes],
+            }
+            if out_fmt == "json":
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"Probed {len(probes)} records from dataset '{args.dataset}':")
+                for p in probes[:3]:
+                    print(f"  - [{p.epistemic_status} conf={p.retrieval_confidence:.3f}] {p.claim}")
             return 0
 
         if args.labbench_jsonl:
@@ -465,7 +528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(format_benchmark_text(summary))
         return 0
 
-    except (ValueError, FileNotFoundError, PermissionError, RuntimeError) as exc:
+    except (KeyError, ValueError, FileNotFoundError, PermissionError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
