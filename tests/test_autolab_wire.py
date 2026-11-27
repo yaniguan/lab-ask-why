@@ -329,3 +329,123 @@ def test_halted_packet_short_circuits_unchanged() -> None:
     assert out["halt_reason"] == "L2_SPEECH_PRIVACY_BLOCK"
     assert len(out["trace"]) == 1
     assert autolab_wire.REPO_ID == "lab-ask-why"
+
+
+def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs() -> None:
+    # 1. Non-mapping packets fail closed without raising TypeError
+    for bad_pkt in (None, 42, "not-a-dict", ["list", "packet"]):
+        res = process_packet(bad_pkt)  # type: ignore[arg-type]
+        assert res["halted"] is True
+        assert res["halt_reason"] == "L6_INVALID_PACKET_TYPE"
+        assert res["trace"][-1]["status"] == "BLOCK"
+        assert res["epistemic_probe"]["conformal_stance_set"] == ["NEI"]
+
+    # 2. Non-boolean flags (especially string "false" or integer 1/0) fail closed
+    for flag_name, bad_val in (
+        ("halted", "false"),
+        ("halted", 1),
+        ("suppress_discriminating_experiment", "false"),
+        ("suppress_discriminating_experiment", 0),
+        ("strict_ask_why", "true"),
+        ("strict_ask_why", 1),
+        ("speech_band_dropped", "yes"),
+    ):
+        res = process_packet({"goal_text": "Aspirin dissolves at 37 C.", flag_name: bad_val})
+        assert res["halted"] is True
+        assert res["halt_reason"] == "L6_INVALID_BOOLEAN_FLAG"
+        assert res["trace"][-1]["status"] == "BLOCK"
+
+    # 3. Non-string, empty, or punctuation-only claims fail closed
+    for bad_claim_pkt in (
+        {"goal_text": ""},
+        {"goal_text": "   "},
+        {"goal_text": "...?!"},
+        {"goal_text": None},
+        {"goal_text": 12345},
+        {"claim": ""},
+        {"claim": ["not", "a", "string"]},
+    ):
+        res = process_packet(bad_claim_pkt)
+        assert res["halted"] is True
+        assert res["halt_reason"] == "L6_INVALID_CLAIM"
+        assert res["trace"][-1]["status"] == "BLOCK"
+
+    # 4. Malformed negative certificates fail closed cleanly without crashing
+    malformed_neg_cases = [
+        # Missing SHA-256 on CERTIFIED_NEGATIVE
+        {
+            "goal_text": "Aspirin dissolves at 37 C.",
+            "certified_ledger_entries": [
+                {
+                    "claim": "Aspirin dissolves at 37 C.",
+                    "attribution_outcome": "CERTIFIED_NEGATIVE",
+                    "summary": "Negative assay readout.",
+                }
+            ],
+        },
+        # Invalid SHA-256 on CERTIFIED_NEGATIVE
+        {
+            "goal_text": "Aspirin dissolves at 37 C.",
+            "certified_ledger_entries": [
+                {
+                    "claim": "Aspirin dissolves at 37 C.",
+                    "attribution_outcome": "CERTIFIED_NEGATIVE",
+                    "summary": "Negative assay readout.",
+                    "sha256": "deadbeef",
+                }
+            ],
+        },
+        # Empty summary on CERTIFIED_NEGATIVE
+        {
+            "goal_text": "Aspirin dissolves at 37 C.",
+            "certified_ledger_entries": [
+                {
+                    "claim": "Aspirin dissolves at 37 C.",
+                    "attribution_outcome": "CERTIFIED_NEGATIVE",
+                    "summary": "   ",
+                    "sha256": "c" * 64,
+                }
+            ],
+        },
+        # Violates Lean certified_negative_sound (execution_clean=False)
+        {
+            "goal_text": "Aspirin dissolves at 37 C.",
+            "certified_ledger_entries": [
+                {
+                    "claim": "Aspirin dissolves at 37 C.",
+                    "attribution_outcome": "CERTIFIED_NEGATIVE",
+                    "summary": "Negative readout despite clogged tip.",
+                    "execution_clean": False,
+                    "sha256": "d" * 64,
+                }
+            ],
+        },
+        # Non-list certified_ledger_entries or non-dict element
+        {"goal_text": "Aspirin dissolves at 37 C.", "certified_ledger_entries": "corrupt"},
+        {"goal_text": "Aspirin dissolves at 37 C.", "certified_ledger_entries": ["not-a-dict"]},
+        {"goal_text": "Aspirin dissolves at 37 C.", "attribution_result": "not-a-dict"},
+    ]
+    for bad_cert_pkt in malformed_neg_cases:
+        res = process_packet(bad_cert_pkt)
+        assert res["halted"] is True
+        assert res["halt_reason"] == "L6_MALFORMED_NEGATIVE_CERTIFICATE"
+        assert res["trace"][-1]["status"] == "BLOCK"
+
+    # 5. Explicit data_source and conformal_stance_set labeling on valid packets
+    default_out = process_packet({})
+    assert default_out["data_source"] == "synthetic_fixture"
+    assert default_out["epistemic_probe"]["data_source"] == "synthetic_fixture"
+    assert set(default_out["epistemic_probe"]["conformal_stance_set"]) >= {"SUPPORT", "CONTRADICT"}
+
+    caller_out = process_packet(
+        {
+            "goal_text": "Phosphate buffer increases aspirin dissolution rate.",
+            "evidence_sentences": [
+                "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates."
+            ],
+        }
+    )
+    assert caller_out["data_source"] == "caller_provided"
+    assert caller_out["epistemic_probe"]["data_source"] == "caller_provided"
+    assert "SUPPORT" in caller_out["epistemic_probe"]["conformal_stance_set"]
+

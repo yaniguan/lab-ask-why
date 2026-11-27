@@ -90,3 +90,51 @@ def compute_auroc(pos_scores: Sequence[float], neg_scores: Sequence[float]) -> f
     diff = pos[:, None] - neg[None, :]
     wins = float(np.sum(diff > 0.0)) + 0.5 * float(np.sum(diff == 0.0))
     return wins / float(pos.size * neg.size)
+
+
+def mean_reciprocal_rank(
+    rankings: Sequence[Sequence[int]],
+    pairs: Sequence[Mapping[str, Any]],
+) -> float:
+    """Mean Reciprocal Rank (MRR) of the highest-ranked gold rationale sentence per pair."""
+    if not pairs or not rankings:
+        return float("nan")
+    rr_vals: list[float] = []
+    for r, p in zip(rankings, pairs):
+        gold = set(p["gold"])
+        if not gold:
+            continue
+        rr = 0.0
+        for rank_idx, sent_idx in enumerate(r, start=1):
+            if sent_idx in gold:
+                rr = 1.0 / float(rank_idx)
+                break
+        rr_vals.append(rr)
+    return float(np.mean(rr_vals)) if rr_vals else float("nan")
+
+
+def macro_f1_score(
+    y_true: Sequence[str],
+    y_pred: Sequence[str],
+    *,
+    labels: Sequence[str] | None = None,
+) -> float:
+    """Unweighted macro-averaged F1 across `labels` (or sorted union of observed classes)."""
+    if not y_true or len(y_true) != len(y_pred):
+        return float("nan")
+    active_labels = (
+        list(labels)
+        if labels is not None
+        else sorted({str(y) for y in y_true} | {str(y) for y in y_pred})
+    )
+    if not active_labels:
+        return float("nan")
+    f1s: list[float] = []
+    for lab in active_labels:
+        tp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == lab and yp == lab)
+        fp = sum(1 for yt, yp in zip(y_true, y_pred) if yt != lab and yp == lab)
+        fn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == lab and yp != lab)
+        denom = 2 * tp + fp + fn
+        f1s.append((2.0 * tp / float(denom)) if denom > 0 else 0.0)
+    return float(np.mean(f1s))
+

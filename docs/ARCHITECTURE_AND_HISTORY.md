@@ -1,4 +1,4 @@
-# Architecture and History — `lab-ask-why`
+# Architecture and History -- `lab-ask-why`
 
 > **Auto-Lab Ecosystem Role**: Layer `L6 · Metacognitive & Epistemic Brain` in [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ([Project Studio](https://yaniguan.github.io/auto-lab/)).
 
@@ -7,146 +7,105 @@
 ## 1. Object
 
 ### Problem Statement
-Standard scientific question-answering and automated co-scientist systems optimize to declare a single winning hypothesis, hiding competing evidence, unstated mechanistic assumptions, and substantial inter-model disagreement (even models with comparable benchmark accuracy disagree on 16–66% of scientific items). When human researchers or multi-agent scientist ensembles disagree on a claim, premature verdict collapse causes wasted wet-lab runs and confirmation bias.
+Standard scientific question-answering and automated co-scientist systems optimize to declare a single winning hypothesis, hiding competing evidence, unstated mechanistic assumptions, and substantial inter-model disagreement (even models with comparable benchmark accuracy disagree on 16-66% of scientific items). When human researchers or multi-agent scientist ensembles disagree on a claim, premature verdict collapse causes wasted wet-lab runs and confirmation bias.
 
-`lab-ask-why` implements an **epistemic Socratic co-scientist** that deliberately refuses to pick a winner. Instead, it asks *"why do you think so?"*, retrieves the concrete rationale sentences supporting or contradicting each side from primary literature, surfaces the latent assumptions required for a claim to hold, and frames the discriminating experimental result that would change minds.
+`lab-ask-why` implements an **epistemic Socratic co-scientist** that refuses forced binary verdict collapse. Instead, it asks *"why do you think so?"*, retrieves verbatim rationale sentences supporting or contradicting each side across primary literature, quantifies epistemic ambiguity via Split-Conformal 3-way stance prediction sets (`{"SUPPORT", "CONTRADICT", "NEI"}`), surfaces latent assumptions, and synthesizes structured falsifiable control-well specifications (`ControlWellSpec`) for the discriminating experiment that would change minds.
 
-### Role in the Auto-Lab `L0`–`L6` Hierarchy
-Within the [Auto-Lab](https://github.com/yaniguan/auto-lab) Brain/Body architecture (`L0`–`L6`), `lab-ask-why` sits at the top-level epistemic layer **`L6 · Metacognitive & Epistemic Brain`** alongside [`lab-decide`](https://github.com/yaniguan/lab-decide):
-- **Peer (`L6` Metacognitive Brain)**: Pairs directly with [`lab-decide`](https://github.com/yaniguan/lab-decide). While `lab-ask-why` decomposes competing scientific hypotheses into supporting/contradicting rationales and proposes *which* discriminating experiment resolves a disagreement, `lab-decide` quantifies whether candidate experiments lie inside a calibrated conformal trust region or require abstention / active data acquisition.
-- **Upstream (`L0`–`L3` Literature, Simulation & Post-Trained Reasoners)**: Draws claims, literature context, and candidate mechanistic predictions from [`YLM`](https://github.com/yaniguan/YLM) (`L0` scientific language model), [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3` `LitQA2`/`ProtocolQA` evaluators and `CalibratedMCQTemplate` / `FaultDiagnosisRepairTemplate` policies), [`WignerFlow`](https://github.com/yaniguan/WignerFlow), and [`assayfold`](https://github.com/yaniguan/assayfold).
-- **Downstream (`L5` / `L4` Experiment Planning & Verification)**: Hands off candidate discriminating test specifications to [`labshift`](https://github.com/yaniguan/labshift) and [`buy-or-make`](https://github.com/yaniguan/buy-or-make) (`L5` workflow/procurement planners), which are audited by [`lab-verify`](https://github.com/yaniguan/lab-verify) and [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal) (`L4`) before robotic execution (`stepbot`, `lab-hands`, `lab-feet`).
-
-### Inputs, Outputs, and Scope Boundaries
-- **Inputs**:
-  - Scientific claims (`claims_dev.jsonl`) paired with candidate literature abstracts (`corpus.jsonl`, sentence-segmented with title and `doc_id`).
-- **Outputs**:
-  - Ranked sentence indices and verbatim rationale sentences per `(claim, abstract)` pair.
-  - Aggregate and label-stratified (`SUPPORT` vs. `CONTRADICT`) top-$k$ rationale hit rates (`k = 1, 3`) benchmarked against a 20-seed random sentence-ranking baseline.
-  - Three structured epistemic probes per claim (`why_questions`): (1) supporting-evidence query, (2) necessary-assumption query, and (3) falsifying/mind-changing experimental result query.
-- **Scope Boundaries**:
-  - The current prototype (`demo/why_probe.py`) evaluates **within-abstract rationale sentence retrieval** given gold evidence documents on the SciFact dev split; open-corpus retrieval across all 5,183 abstracts and handling of `NOINFO` (insufficient-evidence) claims are not yet wired into the script.
-  - `why_questions` currently emits deterministic string templates parameterized by the claim text; synthesizing protocol-executable discriminating experiments conditioned on retrieved supporting and contradicting sentences remains the next milestone.
-  - Zero neural weights or LLM API calls are required (`numpy` + Python standard library only).
+### Role in the Auto-Lab `L0`-`L6` Hierarchy
+Within the [Auto-Lab](https://github.com/yaniguan/auto-lab) Brain/Body architecture (`L0`-`L6`), `lab-ask-why` sits at **`L6 · Metacognitive & Epistemic Brain`** alongside [`lab-decide`](https://github.com/yaniguan/lab-decide):
+- **Peer (`L6` Metacognitive Brain)**: Pairs directly with [`lab-decide`](https://github.com/yaniguan/lab-decide). While `lab-ask-why` decomposes competing scientific hypotheses into supporting/contradicting rationales, Split-Conformal stance sets, and proposed discriminating experiments, `lab-decide` quantifies whether candidate operating points lie inside a calibrated conformal trust region or require active exploration.
+- **Upstream (`L0`-`L3` Sensory, Literature & Post-Trained Reasoners)**: Consumes speech-stripped protocol spans from [`lab-ears`](https://github.com/yaniguan/lab-ears) (`L2`) and connects to [`YLM`](https://github.com/yaniguan/YLM) (`L0`), [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3`), [`WignerFlow`](https://github.com/yaniguan/WignerFlow), and [`assayfold`](https://github.com/yaniguan/assayfold).
+- **Downstream (`L5` / `L4` Planning, Verification & Attribution)**: Hands off `EpistemicProbeResult` and `ControlWellSpec` packets to [`labshift`](https://github.com/yaniguan/labshift), [`buy-or-make`](https://github.com/yaniguan/buy-or-make), and [`lab-automation-atlas`](https://github.com/yaniguan/lab-automation-atlas) (`L5`), audited by [`lab-verify`](https://github.com/yaniguan/lab-verify) and [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal) (`L4`), with post-execution SHA-256 causal attribution certificates closed via [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4`).
 
 ---
 
 ## 2. Data
 
-### Active Benchmark Dataset: SciFact (Wadden et al., EMNLP 2020)
-`demo/why_probe.py` downloads the official SciFact release archive (`https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz`) on demand into the gitignored `data/` directory (**zero redistribution** in the repository):
+### Active Training & Held-Out Benchmark Corpus: SciFact (Wadden et al., EMNLP 2020)
+Downloaded on demand into gitignored `data/` (`CC-BY-NC-2.0`, SHA-256 `11c621288d41ac144d29b13b0f8503b3820b7d6e8b1f6ff24dff335c196d76be`, zero redistribution):
 
-| File | Records | Active Usage in `demo/why_probe.py` | Schema Highlights |
+| File | Records | Active Role in `lab-ask-why` | Schema Highlights |
 |---|---:|---|---|
-| `corpus.jsonl` | `5,183` abstracts | All corpus sentences (`~50k` sentences) fit BM25 `idf` and `avgdl`; gold-evidence abstracts supply candidate sentences (`mean 9.7`, `median 8` sentences/abstract) | `doc_id: int`, `title: str`, `abstract: list[str]`, `structured: bool` |
-| `claims_dev.jsonl` | `300` claims | `188` claims with non-empty `evidence` yield **`209` `(claim, doc_id)` pairs** (`138` `SUPPORT`, `71` `CONTRADICT`); `112` `NOINFO` claims are filtered out (`if c["evidence"]`) | `id: int`, `claim: str`, `evidence: dict[doc_id, list[{sentences, label}]]`, `cited_doc_ids: list[int]` |
-| `claims_train.jsonl` | `809` claims | Present in extracted archive; unused (zero-shot lexical retrieval requires no training split) | Same as `claims_dev.jsonl` |
-| `claims_test.jsonl` | `300` claims | Present in extracted archive; unused (blind test set without gold labels) | `id: int`, `claim: str`, `cited_doc_ids: list[int]` |
+| `corpus.jsonl` | `5,183` abstracts | Indexed for BM25, subword/word TF-IDF Truncated-SVD (`LSA`), and entity/numeric overlap (`93` dev-exclusive docs excluded from IDF/SVD fitting) | `doc_id: int`, `title: str`, `abstract: list[str]` |
+| `claims_train.jsonl` | `809` claims | Strictly partitioned into `607` `train_fit` claims (fitting `CrossFeatureReranker` + 3-way stance weights) and `202` `train_calib` claims (`1 - alpha = 0.90` Split Conformal calibration) | `id: int`, `claim: str`, `evidence`, `cited_doc_ids` |
+| `claims_dev.jsonl` | `300` claims | Held-out evaluation (`188` evidence claims yielding `209` pairs [`138` `SUPPORT`, `71` `CONTRADICT`] + `112` `NOINFO` claims; `0` claim-ID overlap with `train`) | `id: int`, `claim: str`, `evidence`, `cited_doc_ids` |
+| `claims_test.jsonl` | `300` claims | Blind test split without gold labels (unused) | `id: int`, `claim: str`, `cited_doc_ids` |
 
-- **Rationale Structure Nuance**: Among the `209` dev `(claim, doc_id)` pairs, `85` contain multiple independent minimal rationale sets (`len(sets) > 1`) and `25` individual rationale sets require multi-sentence conjunctions (`len(s["sentences"]) > 1`). `build_pairs` unions `s["sentences"]` across all sets for a `(claim, doc_id)` pair into a single `gold` index set.
-- **Reference Output (`demo/output.txt`)**: Checked-in 38-line deterministic stdout capture (`2026-11-18`, Linux CPU).
-
-### Open-Source Dataset Registry & Schema Adapters (`src/lab_ask_why/datasets.py`, 2019–2026)
-In addition to the default SciFact benchmark, `src/lab_ask_why/datasets.py` (`OPEN_DATASET_REGISTRY`) and `scripts/fetch_open_datasets.py` provide typed `OpenDatasetSpec` metadata, SPDX / `commercial_use_ok` / `eval_only` guards (`enforce_dataset_guard`), and deterministic schema adapters (`adapt_record`, `adapt_records`) normalizing `14` open-source scientific claim verification, conflicting-evidence, and literature/protocol QA datasets into `NormalizedClaimRecord(claim, evidence_sentences, label in {'SUPPORT', 'CONTRADICT', 'NOINFO'})` for `BM25` + Socratic `EpistemicProbeResult` probing:
-
-| `dataset_id` | Year | Hub / GitHub ID | SPDX License | `commercial_use_ok` | `eval_only` | Native Schema Normalized to `(claim, evidence_sentences, label)` |
-|---|---:|---|---|---|---|---|
-| `labbench2` | 2026 | [`EdisonScientific/labbench2`](https://huggingface.co/datasets/EdisonScientific/labbench2) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `context` (`litqa3`, `protocolqa2`, `sourcequality`) |
-| `peerqa_xt` | 2026 | [`UKPLab/PeerQA-XT`](https://huggingface.co/datasets/UKPLab/PeerQA-XT) | `CC-BY-NC-SA-4.0` | `False` | `False` | `question` + `answer` (`unanswerable` -> `NOINFO`, grounded answer -> `SUPPORT`) |
-| `sciver` | 2025 | [`chengyewang/SciVer`](https://huggingface.co/datasets/chengyewang/SciVer) | `CC-BY-4.0` | `True` | `False` | `claim`, `origin_statement`, `perturbed_explanation`, `label` (`True`/`Entailed` -> `SUPPORT`, `False`/`Refuted` -> `CONTRADICT`) |
-| `claimcheck` | 2025 | [`JHU-CLSP/CLAIMCHECK`](https://github.com/JHU-CLSP/CLAIMCHECK) | `NOASSERTION` | `False` | `False` | `Target claims`, `Weakness span`, `weakness_type` (`contradictory` -> `CONTRADICT`, `insufficient` -> `NOINFO`) |
-| `chembench` | 2025 | [`jablonkagroup/ChemBench`](https://huggingface.co/datasets/jablonkagroup/ChemBench) | `MIT` | `True` | **`True`** | `examples[0].input`, `target`/`target_scores` JSON, `description` (BIG-bench canary guarded) |
-| `litqa2` | 2024 | [`futurehouse/lab-bench`](https://huggingface.co/datasets/futurehouse/lab-bench) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `key-passage` (`CANARY_NEEDLES` guarded) |
-| `lab_bench` | 2024 | [`futurehouse/lab-bench`](https://huggingface.co/datasets/futurehouse/lab-bench) | `CC-BY-SA-4.0` | `True` | **`True`** | `question` + `ideal`/`distractors` + `protocol` (`ProtocolQA` / `SuppQA` / `DbQA`) |
-| `conflictbank` | 2024 | [`Warrieryes/CB_claim_evidence`](https://huggingface.co/datasets/Warrieryes/CB_claim_evidence) | `CC-BY-SA-4.0` | `True` | `False` | `CB_claim_evidence` (`claim`, `evidence`, `category`) & `CB_qa` (`default_claim` + parametric/conflict evidence) |
-| `faitheval_inconsistent` | 2024 | [`Salesforce/FaithEval-inconsistent-v1.0`](https://huggingface.co/datasets/Salesforce/FaithEval-inconsistent-v1.0) | `CC-BY-NC-SA-4.0` | `False` | `False` | `question`, multi-document conflicting `context`, `answers` (`len(answers) >= 2` -> `CONTRADICT`) |
-| `sciriff` | 2024 | [`allenai/SciRIFF`](https://huggingface.co/datasets/allenai/SciRIFF) | `ODC-BY-1.0` | `True` | `False` | `input` context/claim + structured JSON or string `output` verdict |
-| `bioasq` | 2024 | [`rag-datasets/rag-mini-bioasq`](https://huggingface.co/datasets/rag-datasets/rag-mini-bioasq) | `CC-BY-2.5` | `True` | `False` | `question`/`body`, `exact_answer`/`ideal_answer`/`answer`, `snippets`/`passages` |
-| `scifact_open` | 2022 | [`dwadden/scifact-open`](https://github.com/dwadden/scifact-open) | `CC-BY-NC-2.0` | `False` | `False` | Dict-valued `evidence[doc_id]` (`provenance='citation'|'pooling'`, `label`, `sentences`) over S2ORC corpus |
-| `scifact` | 2020 | [`allenai/scifact`](https://huggingface.co/datasets/allenai/scifact) | `CC-BY-NC-2.0` | `False` | `False` | List-valued `evidence[doc_id]` (`sentences`, `label`) + `cited_doc_ids` (`NOINFO`) |
-| `pubmedqa` | 2019 | [`qiaojin/PubMedQA`](https://huggingface.co/datasets/qiaojin/PubMedQA) | `MIT` | `True` | `False` | `question`, `context.contexts`, `final_decision` (`yes` -> `SUPPORT`, `no` -> `CONTRADICT`, `maybe` -> `NOINFO`) |
-
-### Curated Ecosystem Catalog & Licensing
-`README.md` curates:
-- **14 Open Scientific Benchmarks (`OPEN_DATASET_REGISTRY`)**: Spanning 2019–2026 (`LABBench2`, `PeerQA-XT`, `SciVer`, `CLAIMCHECK`, `ChemBench`, `LitQA2`, `LAB-Bench`, `ConflictBank`, `FaithEval-Inconsistent`, `SciRIFF`, `BioASQ`, `SciFact-Open`, `SciFact`, `PubMedQA`), fetched on demand into gitignored `data/` (`zero redistribution`), with strict `PermissionError` `eval_only` guards preventing `LAB-Bench`, `LitQA2`, `LABBench2`, and `ChemBench` items from entering training, SFT, or RL corpora.
-- **9 Open-Source Co-Scientist / Debate / RAG Repositories**: `stanford-oval/storm`, `SakanaAI/AI-Scientist`, `Future-House/paper-qa`, `ur-whitelab/chemcrow-public`, `Future-House/robin`, `composable-models/llm_multiagent_debate`, `NoviScl/AI-Researcher`, `allenai/scifact`, and `gomesgroup/coscientist`.
-- **13 Foundational & 2026 Papers**: Including *AI Safety via Debate* (`arXiv:1805.00899`), *Co-Scientist* (`arXiv:2502.18864`), *Benchmark Illusion* (`arXiv:2602.11898`), *When Reviews Disagree* (`arXiv:2605.10171`), *Symposium* (`arXiv:2608.19511`), and *ACED-Bench* (`arXiv:2610.14381`).
-- **License Posture**: Repository code is `MIT`; non-commercial (`CC-BY-NC-*`) and unasserted (`NOASSERTION`) datasets are flagged `commercial_use_ok=False` and isolated inside gitignored `data/`.
+### Open-Source Dataset Registry (`src/lab_ask_why/datasets.py`, 2019-2026)
+`OPEN_DATASET_REGISTRY` registers `14` scientific claim verification, conflicting-evidence, and literature/protocol QA datasets (`labbench2`, `peerqa_xt`, `sciver`, `claimcheck`, `chembench`, `litqa2`, `lab_bench`, `conflictbank`, `faitheval_inconsistent`, `sciriff`, `bioasq`, `scifact_open`, `scifact`, `pubmedqa`), enforcing `PermissionError` whenever `purpose != "eval"` on `eval_only=True` benchmarks (`LAB-Bench`, `LitQA2`, `LABBench2`, `ChemBench`) or canary-bearing records.
 
 ---
 
 ## 3. Model
 
-`lab-ask-why` intentionally starts with a **transparent, zero-parameter lexical retrieval baseline + deterministic Socratic question generator** (`demo/why_probe.py`) to establish an interpretable floor before introducing neural rerankers or LLM debate agents:
-
-1. **Lexical Tokenizer (`tokenize`)**:
-   - Lowercases input strings, extracts alphanumeric spans via `re.findall(r"[a-z0-9]+", text.lower())`, and removes a 29-word stopword set (`STOP`, preserving domain negations only outside `not`/`no`).
-2. **Corpus-Level Okapi BM25 Sentence Ranker (`BM25`)**:
-   - Hyperparameters: $k_1 = 1.2$, $b = 0.75$.
-   - Inverse document frequency over $N$ total sentences in `corpus.jsonl`:
-     $$\text{IDF}(t) = \ln\!\left(1 + \frac{N - \text{df}(t) + 0.5}{\text{df}(t) + 0.5}\right)$$
-   - Sentence relevance score for claim $q$ and abstract sentence $s$ with average sentence length $\text{avgdl}$:
-     $$\text{score}(q, s) = \sum_{t \in \text{tokenize}(q)} \mathbb{I}[t \in s] \cdot \text{IDF}(t) \cdot \frac{\text{tf}(t, s)\,(k_1 + 1)}{\text{tf}(t, s) + k_1\!\left(1 - b + b\,\frac{|s|}{\text{avgdl}}\right)}$$
-   - Sentences within each gold evidence abstract are ordered via stable descending sort (`np.argsort(-scores, kind="stable")`).
-3. **20-Seed Monte Carlo Random Baseline**:
-   - Evaluates `np.random.default_rng(seed)` (`seed` $\in \{0, \dots, 19\}$) uniform random sentence permutations on the exact same `209` `(claim, doc_id)` pairs, reporting mean and standard deviation across seeds (`0.197 ± 0.024` at $k=1$; `0.528 ± 0.029` at $k=3$).
-4. **Epistemic Question Generator (`why_questions`)**:
-   - Emits three Socratic prompts per claim targeting (a) empirical evidence, (b) necessary background assumptions, and (c) falsifying/mind-changing experimental outcomes.
+1. **Zero-Parameter Okapi BM25 Lexical Baseline (`src/lab_ask_why/bm25.py`)**:
+   - Biomedical tokenizer (`normalize_biomedical_text`, `tokenize`) mapping Greek characters (`alpha`, `beta`, `delta`, `micro`), preserving `+/-` allele markers (`alpha+`, `cd4-`, `trp53+/-`) and decimal/comma numbers, expanding negative contractions (`cannot`, `does not`), and retaining negation cues (`not`, `no`, `neither`, `without`, `never`).
+   - Query-TF-saturated Okapi BM25 ($k_1 = 1.2$, $b = 0.75$, $k_3 = 1.2$) with background-only IDF (`exclude_doc_ids`) and query-budget score normalization in `[0, 1]`.
+2. **Frontier 2-Stage Hybrid Retrieval, Reranker & Split-Conformal Stance Verifier (`src/lab_ask_why/frontier_verifier.py`)**:
+   - **Stage 1 (`Reciprocal Rank Fusion`)**: Fuses (a) Okapi `BM25`, (b) subword character (`3`/`4`-gram) + biomedical stem/concept TF-IDF `TruncatedSVDSemanticIndex` (`96`-dim `LSA` subspace via sign-canonicalized Halko-Martinsson-Tropp randomized SVD fit strictly on background documents), and (c) `EntityNumericNegationIndex` (acronyms, gene/allele symbols, numeric literals, negations).
+   - **Stage 2 (`CrossFeatureReranker`)**: 26-feature damped Newton-IRLS L2 logistic reranker scoring candidate sentences on within-pool BM25 & LSA z-scores, lexical-dense agreement, IDF-weighted rare-entity coverage, scoped negation & quantitative directionality (`increase`/`decrease`/`inhibit`/`activate`), abstract title anaphora rescue, and discourse section position.
+   - **Stage 2 (`SplitConformalStanceClassifier`)**: 28-feature Nesterov-accelerated L2 multinomial 3-way classifier over `("SUPPORT", "CONTRADICT", "NEI")` with Mondrian Split Conformal quantiles $\hat{q}_{1-\alpha}^{(y)} = s_{(\lceil (n_y + 1)(1 - \alpha) \rceil)}$ calibrated at $1 - \alpha = 0.90$ on held-out `SciFact train_calib`, preserving opposing evidence mass so conflicting multi-document claims emit `{"SUPPORT", "CONTRADICT"}`.
 
 ---
 
-## 4. Training
+## 4. Training & Leak-Free Multi-Dataset Benchmarks (`results/open_benchmarks_2026.json`)
 
-- **Zero Parametric Training (Retrieval-Only Baseline)**: `BM25` requires no gradient updates, GPU compute, or labeled rationale supervision; corpus statistics (`idf`, `avgdl`) are computed in a single CPU pass over `corpus.jsonl` in `< 1` second.
-- **Verified CPU Evaluation Metrics (`demo/output.txt`)**:
+All supervised parameters (`CrossFeatureReranker` and `SplitConformalStanceClassifier`) and conformal quantiles are fit **strictly once on `SciFact train` (`809` claims)** on CPU (`numpy` only, zero LLM API calls) and evaluated zero-leakage across `SciFact dev` and `7` additional downloaded public corpora (`scripts/benchmark_open_datasets.py`, verified against drift by `tests/test_readme_drift.py`):
 
-| Subset / Method | Pairs ($n$) | Hit@1 (`recall@1`) | Hit@3 (`recall@3`) |
-|---|---:|---:|---:|
-| `BM25` (all gold pairs) | `209` | **`0.493`** | **`0.789`** |
-| `Random` (20-seed mean $\pm$ std) | `209` | `0.197 ± 0.024` | `0.528 ± 0.029` |
-| `BM25` on `SUPPORT` pairs | `138` | `0.507` | `0.797` |
-| `BM25` on `CONTRADICT` pairs | `71` | `0.465` | `0.775` |
+<!-- SCIFACT_FRONTIER_TABLE_START -->
+| Method (`SciFact dev`, `n=300` claims / `209` pairs) | Hit@1 | Hit@3 | MRR | Set-Recall@3 | Open `doc_recall@5` | 3-Way Stance Macro-F1 | 90% Conformal Coverage (Avg Size) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `Random` (20 seeds) | `0.197` | `0.528` | `0.419` | -- | -- | -- | -- |
+| `Okapi BM25` (zero-param lexical) | `0.483` | `0.818` | `0.660` | `0.775` | `0.885` | `0.353` | -- |
+| `Dense-SVD` (`LSA` char/word TF-IDF) | `0.411` | `0.761` | `0.615` | `0.732` | `0.490` | `0.281` | -- |
+| `Stage-1 Hybrid RRF` (`BM25+SVD+Entity`) | `0.502` | `0.804` | `0.673` | `0.770` | `0.883` | -- | -- |
+| **`Hybrid + Cross-Feature Reranker`** (`SciFact train`) | **`0.660`** | **`0.909`** | **`0.794`** | **`0.876`** | **`0.883`** | **`0.512`** | **`0.907`** (`2.36`) |
+<!-- SCIFACT_FRONTIER_TABLE_END -->
 
-- **Key Scientific Observation**: Pure lexical overlap retrieves a gold rationale sentence in the top 3 for `78.9%` of claim-abstract pairs (`+26.1` percentage points over random) and performs nearly symmetrically on `SUPPORT` (`0.797`) and `CONTRADICT` (`0.775`) because contradicting sentences share the same entity/process vocabulary as the claim while flipping polarity or directionality.
+Zero-shot cross-benchmark evaluation (`data_source = "real_downloaded"`, SHA-256 verified in gitignored `data/open_benchmarks/`):
+
+<!-- OPEN_BENCHMARKS_2026_TABLE_START -->
+| Dataset (`data_source`) | Evaluated ($n$) | License (`eval_only`) | Baseline (`BM25`) | Frontier (`Hybrid+Reranker`) | Conformal / Conflict Headline |
+|---|---:|---|---|---|---|
+| `SciFact` (`real_downloaded`) | `300` claims (`209` pairs) | `CC-BY-NC-2.0` (`False`) | Hit@1 `0.483`, Hit@3 `0.818` | **Hit@1 `0.660`, Hit@3 `0.909`, MRR `0.794`** | 90% set coverage **`0.907`** (size `2.36`) |
+| `PubMedQA` (`real_downloaded`) | `1000` (`pqa_labeled`) | `MIT` (`False`) | Yes/No Macro-F1 `0.483` | **Yes/No Macro-F1 `0.558`** | 3-way 90% coverage **`0.867`** (`LONG_ANSWER` excluded) |
+| `ConflictBank` (`real_downloaded`) | `200` QA + `200` pairs | `CC-BY-SA-4.0` (`False`) | Conflict detect `0.075` (binary `0.000`) | **Conflict detect `1.000`**, stance F1 **`0.257`** | Multi-label `{SUPPORT, CONTRADICT}` conflict sets |
+| `FaithEval-Inconsistent` (`real_downloaded`) | `300` multi-doc | `CC-BY-NC-SA-4.0` (`False`) | Polarity conflict `0.177` (forced `0.000`) | **Multi-answer conflict detect `0.967`** | Opposing-document grounding + Socratic crux |
+| `CLAIMCHECK` (`real_downloaded`) | `108` critiques | `NOASSERTION` (`False`) | Critique Hit@1 `0.306`, MRR `0.489` | **Critique Hit@1 `0.407`, Hit@3 `0.787`, MRR `0.611`** | 90% coverage **`0.556`** |
+| `SciVer` (`real_downloaded`) | `1000` claims | `CC-BY-4.0` (`False`) | Stance Macro-F1 `0.475` | **Stance Macro-F1 `0.429`** (acc `0.492`) | 90% coverage **`0.588`** (leak-free evidence) |
+| `ChemBench` (`real_downloaded`) | `167` MCQ (`249` raw) | `MIT` (**`True`**) | Option Hit@1 `0.263`, MRR `0.527` | **Option Hit@1 `0.286`, MRR `0.543`** | Canary-guarded `eval_only=True` verified |
+| `LitQA2` (`real_downloaded`) | `194` MCQ (`199` raw) | `CC-BY-SA-4.0` (**`True`**) | Option Hit@1 `0.504`, MRR `0.693` | **Option Hit@1 `0.553`, MRR `0.728`** | Canary-guarded `eval_only=True` verified |
+<!-- OPEN_BENCHMARKS_2026_TABLE_END -->
+
+For reference, the standalone zero-parameter lexical demo (`python demo/why_probe.py`, verified against `demo/output.txt` in CI) achieves `0.483` `Hit@1`, `0.813` `Hit@3` (`0.826` `SUPPORT`, `0.789` `CONTRADICT`), `0.658` `Sentence-Recall@3`, `0.775` `Rationale-Set-Recall@3`, `0.765` `NOINFO` AUROC, and `0.880` open-corpus `doc_recall@5` (`0.596` `sentence_hit@3`).
 
 ---
 
 ## 5. History
 
-| Commit | Date | Author | Branch / Ref | Summary |
-|---|---|---|---|---|
-| `6236123` (`62361235e9d3ac87f11eca78957acccad35fb4e7`) | `2026-11-18` | Yani Guan | `main` | Initial commit (`Add curated resources and first demo`): implemented `demo/why_probe.py` (Okapi BM25 rationale sentence retriever, 20-seed random baseline, `SUPPORT`/`CONTRADICT` stratification, and Socratic `why_questions` templates on SciFact dev), recorded `demo/output.txt`, configured `.github/workflows/demo.yml` (Python 3.12 CI), and curated datasets, co-scientist/debate repositories, and 2018–2026 papers in `README.md`. |
+| Milestone | Ref / PR | Summary |
+|---|---|---|
+| Initial Baseline | `6236123` (`2026-11-18`) | Added `demo/why_probe.py`, `demo/output.txt`, `.github/workflows/demo.yml`, and curated datasets/repos/papers. |
+| Audit Hardening & Typed Schemas | PR `#23` (`e8a033b`) | Resolved Issues `#1..#22`: safe tar extraction, SHA-256 downloads, three-tier rationale metrics, background IDF, `TwoStageRetriever`, `EpistemicProbeResult`, and `LAB-Bench` canary adapter. |
+| Phase-2 Audit, Lean 4 & Wire Loop | PR `#30` (`40af81d`) | Resolved Issues `#24..#29`: floor/ceil permille soundness, multi-claim `EpistemicGraph` proofs in `LabAskWhyLean.lean`, `ControlWellSpec` synthesis, and `autolab_wire.py` closed-loop `lab-attrib` certificates. |
+| 2019-2026 Open Dataset Registry | PR `#31` (`b8a9d51`) | Added `14`-dataset `OPEN_DATASET_REGISTRY` (`datasets.py`) and `scripts/fetch_open_datasets.py` with SPDX/`eval_only` guards. |
+| Frontier Hybrid Verifier & Lean CI | `feat/frontier-hybrid-reranker-conformal-and-benchmarks` | Added `FrontierHybridVerifier` (`BM25 + LSA + Entity RRF` + `CrossFeatureReranker` + `90%` Split-Conformal stance sets), 8-corpus SHA-256 benchmark suite (`results/open_benchmarks_2026.json`), fail-closed `autolab_wire.py` input/certificate checks, Lean 4.36.0 `#print axioms` + `160`-case `#eval` parity CI, and `tests/test_readme_drift.py`. |
 
 ---
 
-## 6. Unique Properties
+## 6. Formal Lean 4.36.0 Verification (`lean/LabAskWhyLean.lean`)
 
-### Epistemic & Architectural Invariants
-1. **Stance-Neutral Rationale Retrieval ("Ask Why, Don't Adjudicate")**: Rather than collapsing uncertainty into a binary `True`/`False` classification, `lab-ask-why` retrieves the verbatim sentences underlying both `SUPPORT` and `CONTRADICT` evidence and pairs them with explicit assumption and falsification probes.
-2. **Polarity-Symmetric Lexical Baseline**: Demonstrated empirically on SciFact dev (`0.797` `SUPPORT` vs. `0.775` `CONTRADICT` top-3 hit rate), establishing a strong, zero-cost, CPU-only attribution baseline that any downstream neural reranker or debate agent must beat.
-3. **Strict Non-Commercial Data Isolation**: Respects SciFact's `CC BY-NC 2.0` license by fetching `data.tar.gz` into gitignored `data/` at runtime while keeping all repository code `MIT`.
-
-### Hardened Statistical & Security Invariants (Audit `#1..#22` Resolved)
-- **Three-Tier Rationale Metrics (`hit@k`, `sentence_recall@k`, `rationale_set_recall@k`)**: Preserves minimal rationale-set boundaries (`rationale_sets: list[frozenset[int]]`) alongside `gold` union, reporting binary `Hit@k` (`0.809`), fractional IR `Sentence-Recall@k` (`0.656`), and strict SciFact complete-rationale `Set-Recall@k` (`0.770`) alongside `lead-k` (`0.263`), `conclusion-first` (`0.679`), and 20-seed random (`0.528`) baselines.
-- **Background-Only IDF, `NOINFO` Abstention Calibration & Open-Corpus Two-Stage Retrieval**: Fits `BM25` on non-evaluation background documents (`exclude_doc_ids`) with smooth Laplace OOV IDF, evaluates all `112` `NOINFO` claims (`AUROC = 0.767`), and scales via an inverted posting index to two-stage open-corpus retrieval across all `5,183` abstracts (`doc_recall@5 = 0.885`, `sentence_hit@3 = 0.559`).
-- **Biomedical Tokenization & Grounded Socratic Probes**: Normalizes Greek letters (`α->alpha`, `β->beta`, `μ->micro`), allele signs (`alpha+`), and decimal/comma numbers (`1,000->1000`, `1.1->1.1`) while retaining negations (`not`, `no`, `neither`, `without`), and grounds `why_questions` in differential rationale mechanisms.
-- **Archive & Transport Hardening + Typed `L6` Contracts**: Enforces timeout-bounded atomic `.part` downloads, SHA-256 verification, PEP 706 `filter="data"` + path-traversal/symlink/AppleDouble validation, `EpistemicProbeResult` JSON Schema export, and evaluation-only `CANARY_NEEDLES`-guarded `LAB-Bench` (`ProtocolQA`/`LitQA2`) counterfactual scoring.
-
-### Sibling-Repository Integration Contracts
-- **[`lab-ears`](https://github.com/yaniguan/lab-ears) (`L2`)**: Supplies speech-stripped acoustic telemetry and parsed wet-lab protocol spans (`parsed_spans`) upstream to `lab-ask-why`.
-- **[`lab-decide`](https://github.com/yaniguan/lab-decide) (`L6`)**: Consumes discriminating-experiment candidates (`epistemic_probe`) from `lab-ask-why` and scores whether proposed operating points lie inside the calibrated conformal trust region or require active exploration.
-- **[`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4`)**: Performs post-execution 4-way causal blame attribution, NNLS precursor ghost-peak deconvolution, and SHA-256 certified ledger updates (`certified_ledger_entries`) feeding back into `L6` epistemic memory and conformal recalibration.
-- **[`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3`)**: Supplies `LitQA2` / `SuppQA` / `ProtocolQA` evaluation harnesses (`labeval/`) and calibrated abstention/counterfactual reward templates (`CalibratedMCQTemplate`, `CounterfactualPairScorer`) to post-train neural `why`-probing policies.
-- **[`lab-verify`](https://github.com/yaniguan/lab-verify) & [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal) (`L4`)**: Audit structured experimental assumptions and dry-run discriminating protocols before wet-lab dispatch.
-- **[`YLM`](https://github.com/yaniguan/YLM) (`L0`) & [`labshift`](https://github.com/yaniguan/labshift) (`L5`)**: Connect literature-grounded Socratic debate (`L6`) to formal `LabLean` specifications and closed-loop campaign scheduling (`L5`).
+`lean/LabAskWhyLean.lean` (`21` theorems, `0 sorry`, standard Lean axioms `propext`, `Classical.choice`, `Quot.sound` only -- audited in CI by `scripts/verify_lean_parity.py` across `160` `#eval` Python parity test cases) formally verifies:
+1. **`checkAskWhy` & Abstention/Crux Invariants**: `checkAskWhy_ok_iff`, `contested_claim_requires_experiment`, `below_noinfo_always_abstains`, `empty_rationale_always_rejected`, and `floor_permille_preserves_abstention`.
+2. **Precursor Ghost-Peak & Characterization Safeguard**: `corrupted_run_never_poisons_memory`, `unidentifiable_spectrum_never_certified`, `ceil_permille_preserves_violation`, `certified_negative_sound`, and `certified_positive_sound`.
+3. **Multi-Claim Campaign Consistency (`EpistemicGraph`)**: `checkEpistemicGraph_none_iff`, `entailment_conflict_requires_experiment`, `entailment_conflict_without_experiment_rejected`, and `mutual_exclusion_conflict_requires_experiment`.
+4. **Split-Conformal 3-Way Stance Sets (`ConformalStanceSet`)**: `conformalStanceSet_nonempty`, `conformal_quantile_covers_support`, and `dual_conformal_evidence_emits_conflict_set`.
 
 ---
 
 ## 7. 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
 
-`autolab_wire.py` (`REPO_ID = "lab-ask-why"`, `LAYER = "L6"`) implements `process_packet(packet: dict) -> dict` for the end-to-end 15-repository Auto-Lab wire protocol (`schema_version = "autolab-wire/v1"`), resolving all repository paths relative to `Path(__file__).resolve().parent` without network I/O:
-
-1. **Envelope & Short-Circuit Semantics**: Deep-copies the incoming packet, initializes `schema_version`, `halted`, `halt_reason`, `trace`, and `bottom_reasoning_traces`, and returns immediately unchanged whenever `packet["halted"]` is `True`.
-2. **Upstream Grounding (`lab-ears` -> `lab-ask-why`)**: Reads `goal_text`, protocol `parsed_spans` from [`lab-ears`](https://github.com/yaniguan/lab-ears) (`L2`), and optional `evidence_sentences` (defaulting to a deterministic 6-sentence wet-lab solubility and protocol support/contradict mini-corpus). Ranks supporting and contradicting sentences via `lab_ask_why.bm25.BM25` and `classify_rationale_polarity`, then generates grounded Socratic probes via `lab_ask_why.socratic.why_questions`.
-3. **Formal Guardrail (`contested_claim_requires_experiment`)**: Mirrors `lean/LabAskWhyLean.lean` (`contested_claim_requires_experiment`). Whenever both supporting and contradicting rationales are retrieved while `suppress_discriminating_experiment` is `True`, `process_packet` sets `halted = True` and `halt_reason = "L6_CONTESTED_WITHOUT_EXPERIMENT"`, recording `"BLOCK"` in `trace` and first-principles falsifiable control design in `bottom_reasoning_traces`.
-4. **Downstream Handoff & Closed-Loop Feedback (`lab-decide` & `lab-attrib`)**: Writes `epistemic_probe` (`claim`, `epistemic_status`, `retrieval_confidence`, `abstain_recommended`, `support_top`, `contradict_top`, `why_questions`, `discriminating_question`, `has_discriminating_experiment`, `discriminating_observable`, `control_wells`, `attribution_feedback`) for [`lab-decide`](https://github.com/yaniguan/lab-decide) (`L6`), cascading through `buy-or-make`, `lab-automation-atlas`, `labshift` (`L5`), `lab-rehearsal`, `lab-verify` (`L4`), `stepbot`, `lab-hands` (`L1`), and `lab-feet` (`L0`), with post-execution readout identifiability (`CERTIFIED_POSITIVE`, `CERTIFIED_NEGATIVE`, `AMBIGUOUS_CHARACTERIZATION`, `EXECUTION_ARTIFACT`) and SHA-256 certified ledger feedback returned via [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4`) and `twinstep`, `labfill`, and `labbench-posttrain` (`L3`).
+`autolab_wire.py` (`REPO_ID = "lab-ask-why"`, `LAYER = "L6"`) implements `process_packet(packet: dict) -> dict` without network I/O:
+1. **Strict Fail-Closed Validation**: Rejects non-mapping envelopes (`L6_INVALID_PACKET_TYPE`), non-boolean flags (`L6_INVALID_BOOLEAN_FLAG`), non-string/empty claims (`L6_INVALID_CLAIM`), invalid evidence lists (`L6_INVALID_EVIDENCE_SENTENCES`), and malformed or unsound `CERTIFIED_NEGATIVE` certificates (`L6_MALFORMED_NEGATIVE_CERTIFICATE`) cleanly with `halted=True` and `status="BLOCK"`.
+2. **Provenance & Split-Conformal Output**: Stamps `data_source` (`"synthetic_fixture"`, `"caller_provided"`, or `"real_downloaded"`), `conformal_stance_set`, `conformal_alpha`, and `stance_probabilities` into `epistemic_probe` alongside `support_top`, `contradict_top`, `why_questions`, `discriminating_observable`, and `control_wells`.
+3. **Formal `contested_claim_requires_experiment` Gate**: Blocks (`L6_CONTESTED_WITHOUT_EXPERIMENT` or `L6_AMBIGUOUS_WITHOUT_ORTHOGONAL_ASSAY`) whenever `suppress_discriminating_experiment=True` coincides with opposing evidence or `AMBIGUOUS_CHARACTERIZATION`.

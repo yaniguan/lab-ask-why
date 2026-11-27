@@ -8,3 +8,5 @@ build/
 dist/
 .venv/
 venv/
+lean/.lake/
+lean/lake-manifest.json

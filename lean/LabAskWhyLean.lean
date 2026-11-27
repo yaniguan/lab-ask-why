@@ -467,7 +467,90 @@ theorem mutual_exclusion_conflict_requires_experiment (g : EpistemicGraph) (mx :
   simp at hedge
   exact hedge (by omega) (by omega)
 
-/-! ## 4. Compile-Time `#guard` Witnesses -/
+/-! ## 4. Split-Conformal 3-Way Stance Set Soundness (`SUPPORT` / `CONTRADICT` / `NEI`) -/
+
+/-- Three-way epistemic stance label space. -/
+inductive StanceLabel where
+  | support
+  | contradict
+  | nei
+  deriving DecidableEq, Repr
+
+/-- Decidable 3-way Split-Conformal prediction set in permille coordinates (`[0, 1000]`). -/
+structure ConformalStanceSet where
+  supportIn    : Bool
+  contradictIn : Bool
+  neiIn        : Bool
+  deriving DecidableEq, Repr
+
+def ConformalStanceSet.contains (s : ConformalStanceSet) : StanceLabel → Bool
+  | .support    => s.supportIn
+  | .contradict => s.contradictIn
+  | .nei        => s.neiIn
+
+def ConformalStanceSet.isContestedConflict (s : ConformalStanceSet) : Bool :=
+  s.supportIn && s.contradictIn
+
+/-- Construct the Split-Conformal set `{y : 1000 - p_y <= qPermille}`, with argmax fallback
+    so extreme low-quantile boundary ties never emit an empty epistemic set. -/
+def conformalStanceSetPermille (pSupport pContradict pNei qPermille : Nat) : ConformalStanceSet :=
+  let sIn := decide (1000 ≤ pSupport + qPermille)
+  let cIn := decide (1000 ≤ pContradict + qPermille)
+  let nIn := decide (1000 ≤ pNei + qPermille)
+  if sIn || cIn || nIn then
+    { supportIn := sIn, contradictIn := cIn, neiIn := nIn }
+  else if decide (pContradict ≤ pSupport ∧ pNei ≤ pSupport) then
+    { supportIn := true, contradictIn := false, neiIn := false }
+  else if decide (pNei ≤ pContradict) then
+    { supportIn := false, contradictIn := true, neiIn := false }
+  else
+    { supportIn := false, contradictIn := false, neiIn := true }
+
+/-- Non-emptiness invariant: `conformalStanceSetPermille` always retains at least one stance. -/
+theorem conformalStanceSet_nonempty (pS pC pN q : Nat) :
+    let cs := conformalStanceSetPermille pS pC pN q
+    cs.supportIn = true ∨ cs.contradictIn = true ∨ cs.neiIn = true := by
+  unfold conformalStanceSetPermille
+  by_cases hany : (decide (1000 ≤ pS + q) || decide (1000 ≤ pC + q) || decide (1000 ≤ pN + q)) = true
+  · simp only [hany, ite_true]
+    rcases Bool.or_eq_true_iff.mp hany with hsc | hn
+    · rcases Bool.or_eq_true_iff.mp hsc with hs | hc
+      · exact Or.inl hs
+      · exact Or.inr (Or.inl hc)
+    · exact Or.inr (Or.inr hn)
+  · simp only [hany]
+    by_cases h1 : decide (pC ≤ pS ∧ pN ≤ pS) = true
+    · simp [h1]
+    · by_cases h2 : decide (pN ≤ pC) = true
+      · simp [h1, h2]
+      · simp [h1, h2]
+
+/-- Coverage soundness: any stance whose nonconformity `1000 - p_y` is bounded by `qPermille`
+    is guaranteed to be included in `conformalStanceSetPermille`. -/
+theorem conformal_quantile_covers_support (pS pC pN q : Nat)
+    (hcov : 1000 ≤ pS + q) :
+    (conformalStanceSetPermille pS pC pN q).contains .support = true := by
+  unfold conformalStanceSetPermille ConformalStanceSet.contains
+  have hs : decide (1000 ≤ pS + q) = true := decide_eq_true hcov
+  simp [hs]
+
+/-- Anti-collapse conflict theorem: whenever both `SUPPORT` and `CONTRADICT` clear the
+    Split-Conformal threshold `1000 <= p + qPermille`, the emitted set retains BOTH labels
+    (`isContestedConflict = true`) rather than collapsing onto a forced binary verdict. -/
+theorem dual_conformal_evidence_emits_conflict_set (pS pC pN q : Nat)
+    (hsup : 1000 ≤ pS + q) (hcon : 1000 ≤ pC + q) :
+    (conformalStanceSetPermille pS pC pN q).isContestedConflict = true := by
+  unfold conformalStanceSetPermille ConformalStanceSet.isContestedConflict
+  have hs : decide (1000 ≤ pS + q) = true := decide_eq_true hsup
+  have hc : decide (1000 ≤ pC + q) = true := decide_eq_true hcon
+  simp [hs, hc]
+
+/-! ## 5. Compile-Time `#guard` Witnesses -/
+
+#guard (conformalStanceSetPermille 480 470 50 700).isContestedConflict == true
+#guard (conformalStanceSetPermille 860 80 60 680) ==
+       { supportIn := true, contradictIn := false, neiIn := false }
+
 
 #guard (checkAskWhy
          { topScorePermille := 789, noinfoThreshPermille := 350,
