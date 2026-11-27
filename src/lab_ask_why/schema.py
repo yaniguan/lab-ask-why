@@ -493,6 +493,52 @@ def check_epistemic_graph_permille(
     return None
 
 
+def attribute_assay_outcome_permille(telemetry: Mapping[str, Any]) -> str:
+    """Runtime Python mirror of `LabAskWhyLean.attributeAssayOutcome`."""
+    exec_clean = (
+        bool(telemetry["preGateCertified"])
+        and bool(telemetry["acousticNormal"])
+        and bool(telemetry["scheduleWindowsRespected"])
+        and bool(telemetry["tactileSeatedCleanly"])
+        and bool(telemetry["posControlPassed"])
+        and bool(telemetry["negControlBlankClean"])
+    )
+    if not exec_clean:
+        return "executionArtifact"
+    identifiable = (
+        int(telemetry["spectralResidualPermille"]) <= int(telemetry["maxResidualPermille"])
+        and int(telemetry["precursorOverlapPermille"]) <= int(telemetry["maxOverlapPermille"])
+    )
+    if not identifiable:
+        return "ambiguousCharacterization"
+    if bool(telemetry["signalAboveActivityThresh"]):
+        return "certifiedPositive"
+    return "certifiedNegative"
+
+
+def conformal_stance_set_permille(
+    p_support: int,
+    p_contradict: int,
+    p_nei: int,
+    q_permille: int,
+) -> dict[str, bool]:
+    """Runtime Python mirror of `LabAskWhyLean.conformalStanceSetPermille`."""
+    ps = int(p_support)
+    pc = int(p_contradict)
+    pn = int(p_nei)
+    q = int(q_permille)
+    s_in = 1000 <= ps + q
+    c_in = 1000 <= pc + q
+    n_in = 1000 <= pn + q
+    if s_in or c_in or n_in:
+        return {"supportIn": s_in, "contradictIn": c_in, "neiIn": n_in}
+    if pc <= ps and pn <= ps:
+        return {"supportIn": True, "contradictIn": False, "neiIn": False}
+    if pn <= pc:
+        return {"supportIn": False, "contradictIn": True, "neiIn": False}
+    return {"supportIn": False, "contradictIn": False, "neiIn": True}
+
+
 def export_probes_jsonl(results: Sequence[EpistemicProbeResult], path: str) -> int:
     """Serialize `EpistemicProbeResult` records as UTF-8 JSONL for lab-decide / labshift."""
     with open(path, mode="w", encoding="utf-8") as fh:
