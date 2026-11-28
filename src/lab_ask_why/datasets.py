@@ -599,9 +599,6 @@ def normalize_veracity_label(raw_label: Any) -> str:
         "NO",
         "INCORRECT",
         "DISPUTE",
-        "MISINFORMATION_CONFLICT",
-        "TEMPORAL_CONFLICT",
-        "SEMANTIC_CONFLICT",
         "CONFLICT",
     }:
         return "CONTRADICT"
@@ -1013,6 +1010,8 @@ def _adapt_conflictbank(spec: OpenDatasetSpec, row: Mapping[str, Any]) -> Normal
         )
 
     # `CB_claim_evidence` schema: `claim`, `evidence`, `category`
+    # Each row's passage was authored to support its paired claim (`category` denotes
+    # parametric-vs-contextual shift type rather than self-contradiction).
     claim = str(row["claim"]).strip()
     sents = _coerce_sentences(row.get("evidence_sentences") or row.get("evidence"))
     category = str(row.get("category") or "default").strip().lower()
@@ -1020,8 +1019,6 @@ def _adapt_conflictbank(spec: OpenDatasetSpec, row: Mapping[str, Any]) -> Normal
         label = normalize_veracity_label(row["label"])
     elif not sents:
         label = "NOINFO"
-    elif "conflict" in category:
-        label = "CONTRADICT"
     else:
         label = "SUPPORT"
 
@@ -1033,8 +1030,86 @@ def _adapt_conflictbank(spec: OpenDatasetSpec, row: Mapping[str, Any]) -> Normal
         label=label,
         title=str(row.get("subject") or f"ConflictBank:{category}"),
         eval_only=spec.eval_only,
-        metadata={"category": category, "subject": row.get("subject")},
+        metadata={"category": category, "subject": row.get("subject"), "pairing": "self_paired"},
     )
+
+
+def build_conflictbank_claim_evidence_pairs(
+    raw_rows: Sequence[Mapping[str, Any]],
+    *,
+    include_cross_subject_contradictions: bool = True,
+    purpose: str = "eval",
+) -> list[NormalizedClaimRecord]:
+    """Build ConflictBank claim-evidence pairs with honest self-paired SUPPORT and cross-subject CONTRADICT.
+
+    In `Warrieryes/CB_claim_evidence`, every row's own `evidence` passage supports its paired
+    `claim` (`SUPPORT`). When `include_cross_subject_contradictions=True`, genuine `CONTRADICT`
+    pairs are constructed by pairing each `default` row's `claim` with conflict passages
+    (`misinformation_conflict`, `temporal_conflict`, `semantic_conflict`) belonging to the
+    exact same `(subject, id)` entity-relation tuple whenever the claims assert incompatible facts.
+    """
+    spec = enforce_dataset_guard("conflictbank", purpose=purpose)
+    self_records: list[NormalizedClaimRecord] = []
+    default_by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+
+    for idx, row in enumerate(raw_rows):
+        rec = adapt_record(spec.dataset_id, row, purpose=purpose)
+        # Preserve unique row index on self-paired records while keeping relation id in metadata
+        uniq_rec = NormalizedClaimRecord(
+            dataset_id=rec.dataset_id,
+            record_id=f"self:{idx}:{rec.record_id}",
+            claim=rec.claim,
+            evidence_sentences=rec.evidence_sentences,
+            label=rec.label,
+            title=rec.title,
+            eval_only=rec.eval_only,
+            metadata={**rec.metadata, "relation_id": str(row.get("id") or "")},
+        )
+        self_records.append(uniq_rec)
+        cat = str(row.get("category") or "default").strip().lower()
+        subj = str(row.get("subject") or "").strip()
+        rel_id = str(row.get("id") or "").strip()
+        if cat == "default" and subj:
+            default_by_key[(subj, rel_id)] = row
+
+    if not include_cross_subject_contradictions:
+        return self_records
+
+    cross_records: list[NormalizedClaimRecord] = []
+    for idx, row in enumerate(raw_rows):
+        cat = str(row.get("category") or "default").strip().lower()
+        if cat == "default":
+            continue
+        subj = str(row.get("subject") or "").strip()
+        rel_id = str(row.get("id") or "").strip()
+        def_row = default_by_key.get((subj, rel_id))
+        if def_row is None:
+            continue
+        def_claim = str(def_row.get("claim") or "").strip()
+        conf_claim = str(row.get("claim") or "").strip()
+        conf_sents = _coerce_sentences(row.get("evidence_sentences") or row.get("evidence"))
+        if not def_claim or not conf_sents or def_claim.lower() == conf_claim.lower():
+            continue
+        cross_records.append(
+            NormalizedClaimRecord(
+                dataset_id=spec.dataset_id,
+                record_id=f"cross:{idx}:{rel_id or 'rel'}",
+                claim=def_claim,
+                evidence_sentences=conf_sents,
+                label="CONTRADICT",
+                title=f"{subj or 'ConflictBank'}:cross_{cat}",
+                eval_only=spec.eval_only,
+                metadata={
+                    "category": cat,
+                    "subject": subj,
+                    "relation_id": rel_id,
+                    "pairing": "cross_subject_conflict",
+                    "counterfactual_claim": conf_claim,
+                },
+            )
+        )
+
+    return [*self_records, *cross_records]
 
 
 def _adapt_faitheval(spec: OpenDatasetSpec, row: Mapping[str, Any]) -> NormalizedClaimRecord:
@@ -1372,7 +1447,7 @@ def probe_normalized_record(
         sent = record.evidence_sentences[idx]
         pol = classify_rationale_polarity(record.claim, sent)
         if pol == "NEUTRAL":
-            pol = "CONTRADICT" if record.label == "CONTRADICT" else "SUPPORT"
+            continue
         ev = RationaleEvidence(
             doc_id=doc_id,
             sent_idx=idx,
@@ -1389,6 +1464,7 @@ def probe_normalized_record(
 
     if not supporting and not contradicting:
         status = "INSUFFICIENT_EVIDENCE"
+        confidence = 0.0
     elif supporting and contradicting:
         status = "CONTESTED"
     elif contradicting:

@@ -15,12 +15,15 @@ for _p in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
 
 import autolab_wire  # noqa: E402
 from autolab_wire import (  # noqa: E402
+    DEFAULT_CALIBRATOR_PATH,
     DEFAULT_WETLAB_EVIDENCE_SENTENCES,
     LAYER,
     REPO_DIR,
     REPO_ID,
     process_packet,
 )
+from lab_ask_why.frontier_verifier import SplitConformalStanceClassifier  # noqa: E402
+from lab_ask_why.schema import check_ask_why_permille  # noqa: E402
 
 
 def test_wire_metadata_and_cwd_independence(
@@ -38,14 +41,30 @@ def test_wire_metadata_and_cwd_independence(
         "urllib.request.urlopen",
         side_effect=AssertionError("Network access must never occur in autolab_wire"),
     ):
-        res = process_packet({})
+        empty_res = process_packet({})
+        demo_res = process_packet({"allow_synthetic_fixture": True})
 
-    assert res["schema_version"] == "autolab-wire/v1"
-    assert res["halted"] is False
-    assert res["halt_reason"] is None
-    assert len(res["epistemic_probe"]["support_top"]) >= 1
-    assert len(res["epistemic_probe"]["contradict_top"]) >= 1
-    assert json.loads(json.dumps(res))["epistemic_probe"]["has_discriminating_experiment"] is True
+    # Without explicit evidence or synthetic opt-in, empty packet abstains cleanly
+    assert empty_res["schema_version"] == "autolab-wire/v1"
+    assert empty_res["halted"] is False
+    assert empty_res["halt_reason"] is None
+    assert empty_res["data_source"] == "no_evidence"
+    assert empty_res["epistemic_probe"]["epistemic_status"] == "INSUFFICIENT_EVIDENCE"
+    assert empty_res["epistemic_probe"]["support_top"] == []
+    assert empty_res["epistemic_probe"]["contradict_top"] == []
+    assert empty_res["epistemic_probe"]["stance_calibrated"] is False
+    assert empty_res["epistemic_probe"]["conformal_alpha"] is None
+    assert empty_res["epistemic_probe"]["conformal_stance_set"] is None
+    assert empty_res["trace"][-1]["status"] == "ABSTAIN"
+
+    # With explicit allow_synthetic_fixture=True, built-in 6-sentence demo corpus is used
+    assert demo_res["schema_version"] == "autolab-wire/v1"
+    assert demo_res["halted"] is False
+    assert demo_res["halt_reason"] is None
+    assert demo_res["data_source"] == "synthetic_fixture"
+    assert len(demo_res["epistemic_probe"]["support_top"]) >= 1
+    assert len(demo_res["epistemic_probe"]["contradict_top"]) >= 1
+    assert json.loads(json.dumps(demo_res))["epistemic_probe"]["has_discriminating_experiment"] is True
 
 
 def test_normal_parsed_spans_handoff_from_lab_ears() -> None:
@@ -53,6 +72,7 @@ def test_normal_parsed_spans_handoff_from_lab_ears() -> None:
         "schema_version": "autolab-wire/v1",
         "halted": False,
         "halt_reason": None,
+        "allow_synthetic_fixture": True,
         "goal_text": (
             "Transfer 100 uL buffered aspirin solution, incubate at 37 C for 15 min "
             "at 300 rpm to assay aqueous solubility."
@@ -109,7 +129,7 @@ def test_normal_parsed_spans_handoff_from_lab_ears() -> None:
     assert "change your mind" in probe["discriminating_question"]
     assert probe["has_discriminating_experiment"] is True
     assert probe["epistemic_status"] == "CONTESTED"
-    assert 0.0 < probe["retrieval_confidence"] <= 1.0
+    assert 0.35 <= probe["retrieval_confidence"] <= 1.0
     assert probe["abstain_recommended"] is False
     assert probe["discriminating_observable"]["candidate_descriptors"]["volume_ul"] == 100.0
     assert probe["discriminating_observable"]["candidate_descriptors"]["temp_c"] == 37.0
@@ -134,7 +154,11 @@ def test_normal_parsed_spans_handoff_from_lab_ears() -> None:
 
 def test_contested_claim_blocks_when_discriminating_experiment_suppressed() -> None:
     packet = {
-        "goal_text": "Incubate 100 uL aspirin at 37 C for 15 min to confirm aqueous solubility.",
+        "goal_text": (
+            "Buffered aqueous incubation of 100 uL aspirin at 37 C for 15 min "
+            "increases equilibrium small-molecule aspirin solubility."
+        ),
+        "allow_synthetic_fixture": True,
         "parsed_spans": {
             "volume_ul": 100.0,
             "temp_c": 37.0,
@@ -207,6 +231,7 @@ def test_issue_24_and_28_neutral_exclusion_and_zero_overlap_insufficient_evidenc
     assert neutral_pkt["epistemic_probe"]["contradict_top"] == []
     assert neutral_pkt["epistemic_probe"]["epistemic_status"] == "INSUFFICIENT_EVIDENCE"
     assert neutral_pkt["epistemic_probe"]["abstain_recommended"] is True
+    assert neutral_pkt["trace"][-1]["status"] == "ABSTAIN"
 
     zero_overlap_pkt = process_packet(
         {
@@ -233,6 +258,146 @@ def test_issue_24_and_28_neutral_exclusion_and_zero_overlap_insufficient_evidenc
     assert strict_pkt["halted"] is True
     assert strict_pkt["halt_reason"] == "L6_INSUFFICIENT_EVIDENCE_ABSTAIN"
     assert strict_pkt["trace"][-1]["status"] == "BLOCK"
+
+
+def test_issue_33_three_exact_unrelated_packets_abstain_and_never_use_aspirin() -> None:
+    unrelated_packets = [
+        {"claim": "CRISPR-Cas9 increases telomere length in senescent cardiomyocytes."},
+        {
+            "claim": "Metformin lowers tumor growth in mice.",
+            "evidence_sentences": [
+                "The mice were housed at 22 C on a 12 h light cycle.",
+                "Bacterial cultures were grown overnight in LB broth.",
+            ],
+        },
+        {
+            "claim": "Aspirin is soluble in water.",
+            "evidence_sentences": [
+                "Water boils at 100 C at sea level.",
+                "The ocean contains salt water.",
+            ],
+        },
+        # Also verify `evidence` alias key behaves identically
+        {
+            "claim": "Metformin lowers tumor growth in mice.",
+            "evidence": [
+                "The mice were housed at 22 C on a 12 h light cycle.",
+                "Bacterial cultures were grown overnight in LB broth.",
+            ],
+        },
+    ]
+
+    for pkt in unrelated_packets:
+        out = process_packet(pkt)
+        probe = out["epistemic_probe"]
+        assert out["halted"] is False
+        assert out["trace"][-1]["status"] == "ABSTAIN"
+        assert probe["epistemic_status"] == "INSUFFICIENT_EVIDENCE"
+        assert probe["abstain_recommended"] is True
+        assert probe["retrieval_confidence"] == 0.0
+        assert probe["support_top"] == []
+        assert probe["contradict_top"] == []
+        assert probe["stance_calibrated"] is False
+        assert probe["conformal_alpha"] is None
+        assert probe["conformal_stance_set"] is None
+
+
+def test_issue_33_every_pass_packet_clears_check_ask_why_permille() -> None:
+    pass_packets = [
+        {"allow_synthetic_fixture": True},
+        {
+            "allow_synthetic_fixture": True,
+            "goal_text": (
+                "Transfer 100 uL buffered aspirin solution, incubate at 37 C for 15 min "
+                "at 300 rpm to assay aqueous solubility."
+            ),
+            "parsed_spans": {"volume_ul": 100.0, "temp_c": 37.0, "duration_min": 15.0},
+        },
+        {
+            "goal_text": "Phosphate buffer increases aspirin dissolution rate.",
+            "evidence_sentences": [
+                "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates.",
+                "Gentle orbital mixing further enhances buffered aspirin dissolution kinetics.",
+            ],
+            "suppress_discriminating_experiment": True,
+        },
+        {
+            "goal_text": "Phosphate buffer increases aspirin dissolution rate.",
+            "evidence_sentences": [
+                "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates.",
+                "Phosphate buffer without stabilizers does not prevent rapid aspirin ester hydrolysis.",
+            ],
+        },
+        {
+            "goal_text": "Solid-state calcination yields pure target polymorph.",
+            "evidence_sentences": [
+                "Solid-state calcination at 700 C yields pure target polymorph Bragg peaks.",
+                "Orthogonal XRD characterization tracks calcination polymorph purity.",
+            ],
+            "attribution_outcome": "AMBIGUOUS_CHARACTERIZATION",
+        },
+    ]
+
+    for pkt in pass_packets:
+        out = process_packet(pkt)
+        assert out["trace"][-1]["status"] == "PASS"
+        probe = out["epistemic_probe"]
+        violation = check_ask_why_permille(
+            probe["retrieval_confidence"],
+            support_hits=len(probe["support_top"]),
+            contradict_hits=len(probe["contradict_top"]),
+            has_discriminating_experiment=probe["has_discriminating_experiment"],
+        )
+        assert violation is None, f"PASS packet violated check_ask_why_permille: {violation}"
+
+
+def test_issue_33_calibrated_vs_uncalibrated_conformal_alpha_and_save_load(
+    tmp_path: Path,
+) -> None:
+    assert DEFAULT_CALIBRATOR_PATH.is_file(), (
+        f"Expected committed SciFact wire calibrator at {DEFAULT_CALIBRATOR_PATH}"
+    )
+    assert DEFAULT_CALIBRATOR_PATH.stat().st_size < 100_000
+
+    # Round-trip save_calibrator / load_calibrator on SplitConformalStanceClassifier
+    loaded_clf = SplitConformalStanceClassifier.load_calibrator(DEFAULT_CALIBRATOR_PATH)
+    assert loaded_clf.is_calibrated is True
+    roundtrip_path = tmp_path / "cal_roundtrip.json"
+    loaded_clf.save_calibrator(roundtrip_path)
+    reloaded = SplitConformalStanceClassifier.load_calibrator(roundtrip_path)
+    assert reloaded.is_calibrated is True
+    assert reloaded.alpha == pytest.approx(0.10)
+    assert reloaded.q_hat_per_class == pytest.approx(loaded_clf.q_hat_per_class)
+
+    base_packet = {
+        "goal_text": "Phosphate buffer increases aspirin dissolution rate.",
+        "evidence_sentences": [
+            "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates.",
+            "Gentle orbital mixing further enhances buffered aspirin dissolution kinetics.",
+        ],
+    }
+
+    # 1. Calibrated mode (default): conformal_alpha == 0.10 and stance_calibrated is True
+    cal_out = process_packet(base_packet)
+    assert cal_out["trace"][-1]["status"] == "PASS"
+    assert cal_out["epistemic_probe"]["stance_calibrated"] is True
+    assert cal_out["epistemic_probe"]["conformal_alpha"] == pytest.approx(0.10)
+    assert isinstance(cal_out["epistemic_probe"]["conformal_stance_set"], list)
+    assert "SUPPORT" in cal_out["epistemic_probe"]["conformal_stance_set"]
+
+    # 2. Uncalibrated mode (use_calibrated_stance=False or missing calibrator): conformal_alpha is None
+    uncal_out = process_packet({**base_packet, "use_calibrated_stance": False})
+    assert uncal_out["trace"][-1]["status"] == "PASS"
+    assert uncal_out["epistemic_probe"]["stance_calibrated"] is False
+    assert uncal_out["epistemic_probe"]["conformal_alpha"] is None
+    assert uncal_out["epistemic_probe"]["conformal_stance_set"] is None
+
+    missing_cal_out = process_packet(
+        {**base_packet, "calibrator_path": str(tmp_path / "does_not_exist.json")}
+    )
+    assert missing_cal_out["epistemic_probe"]["stance_calibrated"] is False
+    assert missing_cal_out["epistemic_probe"]["conformal_alpha"] is None
+    assert missing_cal_out["epistemic_probe"]["conformal_stance_set"] is None
 
 
 def test_issue_28_closed_loop_lab_attrib_certificates_and_orthogonal_probe() -> None:
@@ -338,7 +503,9 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
         assert res["halted"] is True
         assert res["halt_reason"] == "L6_INVALID_PACKET_TYPE"
         assert res["trace"][-1]["status"] == "BLOCK"
-        assert res["epistemic_probe"]["conformal_stance_set"] == ["NEI"]
+        assert res["epistemic_probe"]["conformal_stance_set"] is None
+        assert res["epistemic_probe"]["conformal_alpha"] is None
+        assert res["epistemic_probe"]["stance_calibrated"] is False
 
     # 2. Non-boolean flags (especially string "false" or integer 1/0) fail closed
     for flag_name, bad_val in (
@@ -348,6 +515,9 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
         ("suppress_discriminating_experiment", 0),
         ("strict_ask_why", "true"),
         ("strict_ask_why", 1),
+        ("allow_synthetic_fixture", "true"),
+        ("use_demo_corpus", 1),
+        ("use_calibrated_stance", "false"),
         ("speech_band_dropped", "yes"),
     ):
         res = process_packet({"goal_text": "Aspirin dissolves at 37 C.", flag_name: bad_val})
@@ -372,7 +542,6 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
 
     # 4. Malformed negative certificates fail closed cleanly without crashing
     malformed_neg_cases = [
-        # Missing SHA-256 on CERTIFIED_NEGATIVE
         {
             "goal_text": "Aspirin dissolves at 37 C.",
             "certified_ledger_entries": [
@@ -383,7 +552,6 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
                 }
             ],
         },
-        # Invalid SHA-256 on CERTIFIED_NEGATIVE
         {
             "goal_text": "Aspirin dissolves at 37 C.",
             "certified_ledger_entries": [
@@ -395,7 +563,6 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
                 }
             ],
         },
-        # Empty summary on CERTIFIED_NEGATIVE
         {
             "goal_text": "Aspirin dissolves at 37 C.",
             "certified_ledger_entries": [
@@ -407,7 +574,6 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
                 }
             ],
         },
-        # Violates Lean certified_negative_sound (execution_clean=False)
         {
             "goal_text": "Aspirin dissolves at 37 C.",
             "certified_ledger_entries": [
@@ -420,7 +586,6 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
                 }
             ],
         },
-        # Non-list certified_ledger_entries or non-dict element
         {"goal_text": "Aspirin dissolves at 37 C.", "certified_ledger_entries": "corrupt"},
         {"goal_text": "Aspirin dissolves at 37 C.", "certified_ledger_entries": ["not-a-dict"]},
         {"goal_text": "Aspirin dissolves at 37 C.", "attribution_result": "not-a-dict"},
@@ -431,8 +596,8 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
         assert res["halt_reason"] == "L6_MALFORMED_NEGATIVE_CERTIFICATE"
         assert res["trace"][-1]["status"] == "BLOCK"
 
-    # 5. Explicit data_source and conformal_stance_set labeling on valid packets
-    default_out = process_packet({})
+    # 5. Explicit data_source and calibrated conformal_stance_set labeling on valid packets
+    default_out = process_packet({"allow_synthetic_fixture": True})
     assert default_out["data_source"] == "synthetic_fixture"
     assert default_out["epistemic_probe"]["data_source"] == "synthetic_fixture"
     assert set(default_out["epistemic_probe"]["conformal_stance_set"]) >= {"SUPPORT", "CONTRADICT"}
@@ -441,11 +606,11 @@ def test_fail_closed_invalid_packets_claims_flags_and_malformed_negative_certs()
         {
             "goal_text": "Phosphate buffer increases aspirin dissolution rate.",
             "evidence_sentences": [
-                "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates."
+                "Phosphate buffer at pH 7.4 increases aspirin dissolution rate in 96-well plates.",
+                "Gentle orbital mixing further enhances buffered aspirin dissolution kinetics.",
             ],
         }
     )
     assert caller_out["data_source"] == "caller_provided"
     assert caller_out["epistemic_probe"]["data_source"] == "caller_provided"
     assert "SUPPORT" in caller_out["epistemic_probe"]["conformal_stance_set"]
-
