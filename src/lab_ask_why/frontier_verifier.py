@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import math
+from pathlib import Path
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -40,12 +42,15 @@ from lab_ask_why.bm25 import BM25, normalize_biomedical_text, tokenize
 from lab_ask_why.data import build_noinfo_pairs, build_pairs
 from lab_ask_why.metrics import (
     compute_auroc,
+    compute_official_scifact_metrics,
     hit_at,
     macro_f1_score,
+    majority_class_stance_baseline,
     mean_reciprocal_rank,
     rank_scores,
     rationale_set_recall_at,
     sentence_recall_at,
+    wilson_score_interval,
 )
 from lab_ask_why.retrieval import (
     _NEGATION_TOKENS,
@@ -373,6 +378,10 @@ def _extract_svd_features(text: str) -> Counter[str]:
     return feats
 
 
+_CSR_BLOCK_ROWS = 2048
+_CSR_MAX_BLOCK_NNZ = 262144
+
+
 def _csr_matmul(
     n_rows: int,
     n_cols: int,
@@ -382,16 +391,60 @@ def _csr_matmul(
     dense_rhs: np.ndarray,
     *,
     sp_mat: Any | None = None,
+    block_rows: int = _CSR_BLOCK_ROWS,
+    max_block_nnz: int = _CSR_MAX_BLOCK_NNZ,
 ) -> np.ndarray:
-    """Compute `CSR @ dense_rhs` identically via `scipy.sparse` (if present) or pure NumPy."""
+    """Compute `CSR @ dense_rhs` identically via `scipy.sparse` or bounded-nnz blocked NumPy."""
     if sp_mat is not None:
         return np.asarray(sp_mat @ dense_rhs, dtype=np.float64)
     out = np.zeros((n_rows, dense_rhs.shape[1]), dtype=np.float64)
-    if indices.size == 0:
+    if indices.size == 0 or n_rows == 0:
         return out
-    row_ids = np.repeat(np.arange(n_rows, dtype=np.int32), np.diff(indptr))
-    np.add.at(out, row_ids, data[:, None] * dense_rhs[indices])
+    step = max(1, int(block_rows))
+    nnz_cap = max(1024, int(max_block_nnz))
+    r0 = 0
+    while r0 < n_rows:
+        p0 = int(indptr[r0])
+        r_by_rows = min(n_rows, r0 + step)
+        if int(indptr[r_by_rows]) - p0 > nnz_cap:
+            r_by_nnz = int(np.searchsorted(indptr, p0 + nnz_cap, side="right")) - 1
+            r1 = max(r0 + 1, min(r_by_rows, r_by_nnz))
+        else:
+            r1 = r_by_rows
+        p1 = int(indptr[r1])
+        if p1 > p0:
+            sub_ptr = indptr[r0 : r1 + 1] - p0
+            non_empty = np.diff(sub_ptr) > 0
+            if np.any(non_empty):
+                starts = sub_ptr[:-1][non_empty]
+                weighted = data[p0:p1, None] * dense_rhs[indices[p0:p1]]
+                out[r0:r1][non_empty] = np.add.reduceat(weighted, starts, axis=0)
+        r0 = r1
     return out
+
+
+def _csr_transpose_arrays(
+    n_rows: int,
+    n_cols: int,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert `(n_rows, n_cols)` CSR arrays into transposed `(n_cols, n_rows)` CSR arrays in O(nnz)."""
+    if indices.size == 0:
+        return (
+            np.zeros(n_cols + 1, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+        )
+    row_ids = np.repeat(np.arange(n_rows, dtype=np.int32), np.diff(indptr))
+    order = np.argsort(indices, kind="stable")
+    t_indices = row_ids[order]
+    t_data = data[order]
+    col_counts = np.bincount(indices[order], minlength=n_cols)
+    t_indptr = np.zeros(n_cols + 1, dtype=np.int32)
+    np.cumsum(col_counts, out=t_indptr[1:])
+    return t_indptr, t_indices, t_data
 
 
 def _csr_rmatmul(
@@ -403,16 +456,28 @@ def _csr_rmatmul(
     dense_lhs_t: np.ndarray,
     *,
     sp_mat: Any | None = None,
+    block_rows: int = _CSR_BLOCK_ROWS,
+    t_csr: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Compute `CSR.T @ dense_lhs_t` identically via `scipy.sparse` or pure NumPy."""
+    """Compute `CSR.T @ dense_lhs_t` identically via `scipy.sparse` or bounded-memory blocked NumPy."""
     if sp_mat is not None:
         return np.asarray(sp_mat.T @ dense_lhs_t, dtype=np.float64)
-    out = np.zeros((n_cols, dense_lhs_t.shape[1]), dtype=np.float64)
-    if indices.size == 0:
-        return out
-    row_ids = np.repeat(np.arange(n_rows, dtype=np.int32), np.diff(indptr))
-    np.add.at(out, indices, data[:, None] * dense_lhs_t[row_ids])
-    return out
+    if indices.size == 0 or n_rows == 0 or n_cols == 0:
+        return np.zeros((n_cols, dense_lhs_t.shape[1]), dtype=np.float64)
+    if t_csr is None:
+        t_indptr, t_indices, t_data = _csr_transpose_arrays(n_rows, n_cols, indptr, indices, data)
+    else:
+        t_indptr, t_indices, t_data = t_csr
+    return _csr_matmul(
+        n_cols,
+        n_rows,
+        t_indptr,
+        t_indices,
+        t_data,
+        dense_lhs_t,
+        sp_mat=None,
+        block_rows=block_rows,
+    )
 
 
 class TruncatedSVDSemanticIndex:
@@ -486,7 +551,12 @@ class TruncatedSVDSemanticIndex:
         else:
             bg_feats = [all_feats[i] for i in bg_indices]
             bg_indptr, bg_indices_arr, bg_data = self._build_csr_arrays(bg_feats)
+            del bg_feats
             bg_sp = None
+
+        # Free Python Counter feature dicts prior to randomized SVD iterations to cap peak RSS
+        del all_feats
+        del df
 
         k = max(1, min(int(n_components), len(bg_indices) - 1 if len(bg_indices) > 1 else 1, v_size))
         self.n_components = k
@@ -509,13 +579,25 @@ class TruncatedSVDSemanticIndex:
             sketch_dim = min(v_size, k + oversample)
             rng = np.random.default_rng(self.seed)
             omega = rng.standard_normal((v_size, sketch_dim))
+            bg_t_csr = (
+                _csr_transpose_arrays(len(bg_indices), v_size, bg_indptr, bg_indices_arr, bg_data)
+                if bg_sp is None
+                else None
+            )
             y_mat = _csr_matmul(
                 len(bg_indices), v_size, bg_indptr, bg_indices_arr, bg_data, omega, sp_mat=bg_sp
             )
             q_mat, _ = np.linalg.qr(y_mat, mode="reduced")
             for _ in range(max(1, int(n_iter))):
                 z_mat = _csr_rmatmul(
-                    len(bg_indices), v_size, bg_indptr, bg_indices_arr, bg_data, q_mat, sp_mat=bg_sp
+                    len(bg_indices),
+                    v_size,
+                    bg_indptr,
+                    bg_indices_arr,
+                    bg_data,
+                    q_mat,
+                    sp_mat=bg_sp,
+                    t_csr=bg_t_csr,
                 )
                 z_orth, _ = np.linalg.qr(z_mat, mode="reduced")
                 y_mat = _csr_matmul(
@@ -524,8 +606,16 @@ class TruncatedSVDSemanticIndex:
                 q_mat, _ = np.linalg.qr(y_mat, mode="reduced")
 
             b_t = _csr_rmatmul(
-                len(bg_indices), v_size, bg_indptr, bg_indices_arr, bg_data, q_mat, sp_mat=bg_sp
+                len(bg_indices),
+                v_size,
+                bg_indptr,
+                bg_indices_arr,
+                bg_data,
+                q_mat,
+                sp_mat=bg_sp,
+                t_csr=bg_t_csr,
             )
+            del bg_t_csr
             # b_t = X_bg.T @ Q has shape (v_size, q_cols); B = Q.T @ X_bg = b_t.T
             _, _, vt = np.linalg.svd(b_t.T, full_matrices=False)
             vt_k = vt[:k].copy()
@@ -1286,6 +1376,23 @@ class CrossFeatureReranker:
         logits = np.clip(z @ self.weights + self.bias, -30.0, 30.0)
         return 1.0 / (1.0 + np.exp(-logits))
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "weights": [round(float(x), 8) for x in self.weights.tolist()],
+            "bias": round(float(self.bias), 8),
+            "feat_mean": [round(float(x), 8) for x in self.feat_mean.tolist()],
+            "feat_std": [round(float(x), 8) for x in self.feat_std.tolist()],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CrossFeatureReranker":
+        return cls(
+            weights=np.asarray(data["weights"], dtype=np.float64),
+            bias=float(data["bias"]),
+            feat_mean=np.asarray(data["feat_mean"], dtype=np.float64),
+            feat_std=np.asarray(data["feat_std"], dtype=np.float64),
+        )
+
 
 def _extract_stance_feature_vector(
     claim: str,
@@ -1436,6 +1543,7 @@ class SplitConformalStanceClassifier:
         q_hat_per_class: Mapping[str, float] | None = None,
         conformal_mode: str = "mondrian",
         temperature: float = 1.0,
+        is_calibrated: bool = False,
     ) -> None:
         if not (0.0 < alpha < 1.0):
             raise ValueError(f"Conformal miscoverage alpha must lie in (0, 1), got {alpha!r}")
@@ -1454,6 +1562,7 @@ class SplitConformalStanceClassifier:
         )
         self.conformal_mode = conformal_mode
         self.temperature = max(0.1, float(temperature))
+        self.is_calibrated = bool(is_calibrated)
 
     @classmethod
     def default_prior(cls, *, alpha: float = 0.10) -> "SplitConformalStanceClassifier":
@@ -1516,28 +1625,10 @@ class SplitConformalStanceClassifier:
         sup_mass: float = 0.0,
         con_mass: float = 0.0,
     ) -> tuple[np.ndarray, bool]:
-        """Compute calibrated 3-way `(SUPPORT, CONTRADICT, NEI)` probabilities and conflict flag."""
+        """Compute calibrated 3-way `(SUPPORT, CONTRADICT, NEI)` probabilities without heuristic blending."""
+        _ = (sup_mass, con_mass)
         probs = self._raw_softmax(feat_vec[None, :])[0].copy()
-        is_conflict = False
-
-        # When retrieved evidence simultaneously carries strong supporting AND strong
-        # contradicting rationales (e.g., conflicting multi-paper or protocol readouts),
-        # preserve epistemic duality rather than collapsing onto one binary pole.
-        min_dual = min(sup_mass, con_mass)
-        max_dual = max(sup_mass, con_mass)
-        if min_dual >= 0.32 and (min_dual / max(max_dual, 1e-9)) >= 0.55 and probs[2] < 0.55:
-            is_conflict = True
-            non_nei_mass = max(0.76, 1.0 - float(probs[2]))
-            total_dual = sup_mass + con_mass
-            p_sup_dual = non_nei_mass * (sup_mass / total_dual)
-            p_con_dual = non_nei_mass * (con_mass / total_dual)
-            blend = min(0.85, 1.6 * min_dual)
-            probs[0] = (1.0 - blend) * float(probs[0]) + blend * p_sup_dual
-            probs[1] = (1.0 - blend) * float(probs[1]) + blend * p_con_dual
-            probs[2] = max(0.0, 1.0 - probs[0] - probs[1])
-            probs /= float(np.sum(probs))
-
-        return probs, is_conflict
+        return probs, False
 
     @staticmethod
     def conformal_quantile(scores: Sequence[float], alpha: float) -> float:
@@ -1583,11 +1674,63 @@ class SplitConformalStanceClassifier:
                 self.q_hat_per_class[lab] = self.conformal_quantile(by_cls[lab], self.alpha)
             else:
                 self.q_hat_per_class[lab] = self.q_hat_marginal
+        self.is_calibrated = True
         return {
             "alpha": self.alpha,
             "q_hat_marginal": self.q_hat_marginal,
             **{f"q_hat_{lab.lower()}": self.q_hat_per_class[lab] for lab in STANCE_LABELS},
         }
+
+    def to_calibrator_dict(self) -> dict[str, Any]:
+        """Serialize classifier weights, normalization stats, and conformal quantiles to a compact dict."""
+        return {
+            "weights": [[round(float(v), 8) for v in row] for row in self.weights.tolist()],
+            "bias": [round(float(v), 8) for v in self.bias.tolist()],
+            "feat_mean": [round(float(v), 8) for v in self.feat_mean.tolist()],
+            "feat_std": [round(float(v), 8) for v in self.feat_std.tolist()],
+            "alpha": float(self.alpha),
+            "q_hat_marginal": round(float(self.q_hat_marginal), 8),
+            "q_hat_per_class": {
+                lab: round(float(self.q_hat_per_class[lab]), 8) for lab in STANCE_LABELS
+            },
+            "conformal_mode": self.conformal_mode,
+            "temperature": round(float(self.temperature), 8),
+            "is_calibrated": bool(self.is_calibrated),
+        }
+
+    @classmethod
+    def from_calibrator_dict(cls, data: Mapping[str, Any]) -> "SplitConformalStanceClassifier":
+        """Reconstruct a `SplitConformalStanceClassifier` from `to_calibrator_dict` output."""
+        return cls(
+            weights=np.asarray(data["weights"], dtype=np.float64),
+            bias=np.asarray(data["bias"], dtype=np.float64),
+            feat_mean=np.asarray(data["feat_mean"], dtype=np.float64),
+            feat_std=np.asarray(data["feat_std"], dtype=np.float64),
+            alpha=float(data["alpha"]),
+            q_hat_marginal=float(data["q_hat_marginal"]),
+            q_hat_per_class=dict(data["q_hat_per_class"]),
+            conformal_mode=str(data.get("conformal_mode", "mondrian")),
+            temperature=float(data.get("temperature", 1.0)),
+            is_calibrated=bool(data.get("is_calibrated", True)),
+        )
+
+    def save_calibrator(self, path: str | Path) -> Path:
+        """Persist calibrated stance weights and Mondrian quantiles to a compact JSON file."""
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            json.dumps(self.to_calibrator_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return dest
+
+    @classmethod
+    def load_calibrator(cls, path: str | Path) -> "SplitConformalStanceClassifier":
+        """Load calibrated stance weights and Mondrian quantiles from a JSON file."""
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if "candidate_stance_classifier" in payload:
+            return cls.from_calibrator_dict(payload["candidate_stance_classifier"])
+        return cls.from_calibrator_dict(payload)
 
     def prediction_set_from_probs(
         self,
@@ -1623,10 +1766,10 @@ class SplitConformalStanceClassifier:
 def split_scifact_train_fit_and_calib(
     train_claims: Sequence[Mapping[str, Any]],
     *,
-    calib_fraction: float = 0.20,
+    calib_fraction: float = 0.25,
     seed: int = 2026,
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
-    """Deterministically partition `SciFact train` (`809` claims) into `train_fit` and `train_calib`.
+    """Deterministically partition `SciFact train` (`809` claims: `607` fit + `202` cal at `0.25`).
 
     Stratifies across `SUPPORT`, `CONTRADICT`, and `NEI` so the held-out conformal
     calibration fold mirrors the empirical label distribution with zero overlap.
@@ -1776,6 +1919,9 @@ class FrontierHybridVerifier:
             else SplitConformalStanceClassifier.default_prior(alpha=alpha)
         )
         self.candidate_stance_classifier: SplitConformalStanceClassifier = self.stance_classifier
+        self.conflict_threshold: float = 0.32
+        self.official_doc_non_nei_threshold: float = 0.62
+        self.official_sent_rerank_threshold: float = 0.50
         self.training_provenance: dict[str, Any] = dict(
             training_provenance
             or {
@@ -1794,7 +1940,7 @@ class FrontierHybridVerifier:
         exclude_doc_ids: Iterable[Any] | None = None,
         svd_components: int = 96,
         alpha: float = 0.10,
-        calib_fraction: float = 0.20,
+        calib_fraction: float = 0.25,
         seed: int = 2026,
     ) -> "FrontierHybridVerifier":
         """Train Stage-2 reranker & 3-way stance verifier strictly on `SciFact train` (`809` claims).
@@ -1802,22 +1948,46 @@ class FrontierHybridVerifier:
         1. Fits Stage-1 BM25, Truncated-SVD (`LSA`), and Entity/Numeric/Negation indices on
            `corpus` while excluding `exclude_doc_ids` (e.g., all `SciFact dev` doc IDs) from
            IDF and SVD basis estimation so zero evaluation-split statistics leak.
-        2. Splits `train_claims` (`809` claims) into `train_fit` (`80%`) and `train_calib` (`20%`).
+        2. Splits `train_claims` (`809` claims) into `train_fit` (`607` claims, `75%`) and
+           `train_calib` (`202` claims, `25%`).
         3. Fits `CrossFeatureReranker` on `(claim, candidate_sentence)` pairs from `train_fit`.
-        4. Fits `SplitConformalStanceClassifier` on `train_fit` claims (both oracle cited/evidence
-           contexts and open-corpus retrieved contexts so the classifier is calibrated across
-           within-abstract and open-corpus distributions).
-        5. Calibrates `1 - alpha` Split Conformal prediction sets strictly on `train_calib`.
+        4. Fits separate `SplitConformalStanceClassifier` heads for open-corpus retrieval and
+           candidate-abstract verification on `train_fit` using the exact test-time feature paths.
+        5. Calibrates `1 - alpha` Mondrian Split Conformal prediction sets and the bilateral
+           cross-passage conflict threshold strictly on held-out `train_calib`.
         """
+        fit_claims, calib_claims = split_scifact_train_fit_and_calib(
+            train_claims, calib_fraction=calib_fraction, seed=seed
+        )
+        # Exclude `calib_claims`-exclusive docs alongside `exclude_doc_ids` from Stage-1 IDF/SVD
+        # so `calib_claims` and held-out `dev` claims are strictly exchangeable at calibration time.
+        fit_doc_ids = {
+            str(did)
+            for c in fit_claims
+            for did in [
+                *list((c.get("evidence") or {}).keys()),
+                *[str(x) for x in (c.get("cited_doc_ids") or ())],
+            ]
+        }
+        calib_doc_ids = {
+            str(did)
+            for c in calib_claims
+            for did in [
+                *list((c.get("evidence") or {}).keys()),
+                *[str(x) for x in (c.get("cited_doc_ids") or ())],
+            ]
+        }
+        calib_only_doc_ids = calib_doc_ids - fit_doc_ids
+        combined_excluded = {str(did) for did in (exclude_doc_ids or ())} | calib_only_doc_ids
+        if len(combined_excluded) >= len(corpus):
+            combined_excluded = {str(did) for did in (exclude_doc_ids or ())}
+
         verifier = cls(
             corpus,
-            exclude_doc_ids=exclude_doc_ids,
+            exclude_doc_ids=combined_excluded,
             svd_components=svd_components,
             alpha=alpha,
             seed=seed,
-        )
-        fit_claims, calib_claims = split_scifact_train_fit_and_calib(
-            train_claims, calib_fraction=calib_fraction, seed=seed
         )
 
         # --- Step 1: Fit Stage-2 Pairwise Claim-Sentence Reranker on `fit_claims` ---
@@ -1930,14 +2100,26 @@ class FrontierHybridVerifier:
                         if isinstance(e, Mapping)
                     }
                     p_lab = "CONTRADICT" if "CONTRADICT" in pair_labs else "SUPPORT"
-                    vec_doc, _, _ = verifier._stance_features_for_doc(claim_str, doc_key, top_k=3)
+                    doc_obj = corpus[doc_key]
+                    vec_doc, _, _ = verifier._stance_features_for_candidate_sentences(
+                        claim_str,
+                        list(doc_obj.get("abstract", ())),
+                        title=str(doc_obj.get("title", "")),
+                        top_k=3,
+                    )
                     cand_x_rows.append(vec_doc)
                     cand_y_rows.append(_STANCE_TO_IDX[p_lab])
             else:
                 for raw_did in (c.get("cited_doc_ids") or ())[:1]:
                     doc_key = verifier._resolve_doc_key(raw_did)
                     if doc_key is not None:
-                        vec_doc, _, _ = verifier._stance_features_for_doc(claim_str, doc_key, top_k=3)
+                        doc_obj = corpus[doc_key]
+                        vec_doc, _, _ = verifier._stance_features_for_candidate_sentences(
+                            claim_str,
+                            list(doc_obj.get("abstract", ())),
+                            title=str(doc_obj.get("title", "")),
+                            top_k=3,
+                        )
                         cand_x_rows.append(vec_doc)
                         cand_y_rows.append(_STANCE_TO_IDX["NEI"])
 
@@ -1948,52 +2130,82 @@ class FrontierHybridVerifier:
             sy = np.asarray(y_rows, dtype=np.int32)
             counts = np.bincount(sy, minlength=3).astype(np.float64)
             inv_freq = np.sum(counts) / (3.0 * np.maximum(counts, 1.0))
-            s_sw = inv_freq[sy]
 
             best_l2 = 4.0
+            best_pow = 0.5
             best_f1 = -1.0
-            for cand_l2 in (1.5, 4.0, 10.0, 20.0):
-                oof_preds: list[str] = []
-                oof_true: list[str] = []
-                for fold in range(3):
-                    val_mask = (np.arange(len(sy)) % 3) == fold
-                    tr_mask = ~val_mask
-                    if not np.any(tr_mask) or not np.any(val_mask):
-                        continue
-                    w_cv, b_cv, m_cv, s_cv = _fit_multinomial_logistic(
-                        sx[tr_mask], sy[tr_mask], l2_reg=cand_l2, sample_weight=s_sw[tr_mask]
-                    )
-                    tmp_clf = SplitConformalStanceClassifier(w_cv, b_cv, m_cv, s_cv, alpha=alpha)
-                    val_probs = tmp_clf._raw_softmax(sx[val_mask])
-                    for pi, yi in zip(np.argmax(val_probs, axis=1), sy[val_mask]):
-                        oof_preds.append(STANCE_LABELS[int(pi)])
-                        oof_true.append(STANCE_LABELS[int(yi)])
-                f1_cv = macro_f1_score(oof_true, oof_preds, labels=STANCE_LABELS)
-                if not math.isnan(f1_cv) and f1_cv > best_f1:
-                    best_f1 = f1_cv
-                    best_l2 = cand_l2
+            best_oof_logits = np.zeros((len(sy), 3), dtype=np.float64)
 
+            for w_pow in (0.0, 0.5, 1.0):
+                s_sw = np.power(inv_freq[sy], w_pow)
+                for cand_l2 in (1.5, 4.0, 10.0, 20.0):
+                    oof_preds: list[str] = []
+                    oof_true: list[str] = []
+                    oof_logits = np.zeros((len(sy), 3), dtype=np.float64)
+                    for fold in range(3):
+                        val_mask = (np.arange(len(sy)) % 3) == fold
+                        tr_mask = ~val_mask
+                        if not np.any(tr_mask) or not np.any(val_mask):
+                            continue
+                        w_cv, b_cv, m_cv, s_cv = _fit_multinomial_logistic(
+                            sx[tr_mask], sy[tr_mask], l2_reg=cand_l2, sample_weight=s_sw[tr_mask]
+                        )
+                        z_val = (sx[val_mask] - m_cv) / s_cv
+                        val_logits = z_val @ w_cv + b_cv[None, :]
+                        oof_logits[val_mask] = val_logits
+                        for pi, yi in zip(np.argmax(val_logits, axis=1), sy[val_mask]):
+                            oof_preds.append(STANCE_LABELS[int(pi)])
+                            oof_true.append(STANCE_LABELS[int(yi)])
+                    f1_cv = macro_f1_score(oof_true, oof_preds, labels=STANCE_LABELS)
+                    if not math.isnan(f1_cv) and f1_cv > best_f1:
+                        best_f1 = f1_cv
+                        best_l2 = cand_l2
+                        best_pow = w_pow
+                        best_oof_logits = oof_logits
+
+            s_sw_best = np.power(inv_freq[sy], best_pow)
             st_w, st_b, st_mean, st_std = _fit_multinomial_logistic(
-                sx, sy, l2_reg=best_l2, sample_weight=s_sw
-            )
-            return SplitConformalStanceClassifier(
-                st_w, st_b, st_mean, st_std, alpha=alpha, conformal_mode="mondrian"
+                sx, sy, l2_reg=best_l2, sample_weight=s_sw_best
             )
 
-        pooled_x = [*open_x_rows, *cand_x_rows]
-        pooled_y = [*open_y_rows, *cand_y_rows]
-        if pooled_x:
-            verifier.stance_classifier = _fit_cv_stance_head(pooled_x, pooled_y)
+            # Post-hoc temperature scaling on OOF `fit_claims` logits (0% `calib_claims` leakage)
+            best_temp = 1.0
+            if len(sy) >= 12:
+                best_nll = float("inf")
+                for cand_t in (0.45, 0.60, 0.75, 0.90, 1.0, 1.15, 1.35):
+                    scaled = best_oof_logits / cand_t
+                    scaled -= np.max(scaled, axis=1, keepdims=True)
+                    p_oof = np.exp(scaled)
+                    p_oof /= np.sum(p_oof, axis=1, keepdims=True)
+                    nll = -float(np.mean(np.log(np.clip(p_oof[np.arange(len(sy)), sy], 1e-9, 1.0))))
+                    if nll < best_nll:
+                        best_nll = nll
+                        best_temp = cand_t
+
+            return SplitConformalStanceClassifier(
+                st_w,
+                st_b,
+                st_mean,
+                st_std,
+                alpha=alpha,
+                conformal_mode="mondrian",
+                temperature=best_temp,
+                is_calibrated=False,
+            )
+
+        if open_x_rows:
+            verifier.stance_classifier = _fit_cv_stance_head(open_x_rows, open_y_rows)
         if cand_x_rows:
             verifier.candidate_stance_classifier = _fit_cv_stance_head(cand_x_rows, cand_y_rows)
         else:
             verifier.candidate_stance_classifier = verifier.stance_classifier
 
-        # --- Step 3: Split Conformal Calibration on Held-Out `calib_claims` ---
+        # --- Step 3: Split Conformal & Bilateral Conflict Calibration on Held-Out `calib_claims` ---
         cal_probs_list: list[np.ndarray] = []
         cal_labels_list: list[str] = []
         cand_cal_probs: list[np.ndarray] = []
         cand_cal_labels: list[str] = []
+        neg_conflict_scores: list[float] = []
 
         for c in calib_claims:
             gold_lab = _claim_gold_stance(c)
@@ -2019,17 +2231,42 @@ class FrontierHybridVerifier:
                         if isinstance(e, Mapping)
                     }
                     p_lab = "CONTRADICT" if "CONTRADICT" in pair_labs else "SUPPORT"
-                    d_vec, d_sup, d_con = verifier._stance_features_for_doc(claim_str, doc_key, top_k=3)
+                    doc_obj = corpus[doc_key]
+                    abs_sents = [str(s) for s in doc_obj.get("abstract", ())]
+                    d_vec, d_sup, d_con = verifier._stance_features_for_candidate_sentences(
+                        claim_str,
+                        abs_sents,
+                        title=str(doc_obj.get("title", "")),
+                        top_k=3,
+                    )
                     dp_vec, _ = verifier.candidate_stance_classifier.predict_proba_from_features(
                         d_vec, sup_mass=d_sup, con_mass=d_con
                     )
                     cand_cal_probs.append(dp_vec)
                     cand_cal_labels.append(p_lab)
+                    if len(abs_sents) >= 2:
+                        neg_conflict_scores.append(
+                            verifier.score_bilateral_conflict(claim_str, abs_sents)["conflict_score"]
+                        )
+                        if len(abs_sents) >= 4:
+                            mid = len(abs_sents) // 2
+                            neg_conflict_scores.append(
+                                verifier.score_bilateral_conflict(
+                                    claim_str,
+                                    [" ".join(abs_sents[:mid]), " ".join(abs_sents[mid:])],
+                                )["conflict_score"]
+                            )
             else:
                 for raw_did in (c.get("cited_doc_ids") or ()):
                     doc_key = verifier._resolve_doc_key(raw_did)
                     if doc_key is not None:
-                        d_vec, d_sup, d_con = verifier._stance_features_for_doc(claim_str, doc_key, top_k=3)
+                        doc_obj = corpus[doc_key]
+                        d_vec, d_sup, d_con = verifier._stance_features_for_candidate_sentences(
+                            claim_str,
+                            list(doc_obj.get("abstract", ())),
+                            title=str(doc_obj.get("title", "")),
+                            top_k=3,
+                        )
                         dp_vec, _ = verifier.candidate_stance_classifier.predict_proba_from_features(
                             d_vec, sup_mass=d_sup, con_mass=d_con
                         )
@@ -2037,15 +2274,66 @@ class FrontierHybridVerifier:
                         cand_cal_labels.append("NEI")
 
         conformal_summary: dict[str, float] = {}
+        cand_conformal_summary: dict[str, float] = {}
         if cal_probs_list:
             cal_mat = np.vstack(cal_probs_list)
             conformal_summary = verifier.stance_classifier.calibrate_split_conformal(
                 cal_mat, cal_labels_list, alpha=alpha
             )
         if cand_cal_probs:
-            verifier.candidate_stance_classifier.calibrate_split_conformal(
+            cand_conformal_summary = verifier.candidate_stance_classifier.calibrate_split_conformal(
                 np.vstack(cand_cal_probs), cand_cal_labels, alpha=alpha
             )
+
+        if len(neg_conflict_scores) >= 25:
+            q95 = SplitConformalStanceClassifier.conformal_quantile(neg_conflict_scores, alpha=0.05)
+            verifier.conflict_threshold = float(np.clip(max(0.42, q95), 0.42, 0.85))
+
+        # Calibrate official SciFact abstract selection threshold strictly on `fit_claims`
+        if len(fit_claims) >= 20:
+            fit_doc_cands: list[tuple[str, str, str, float, list[tuple[int, float]]]] = []
+            for fc in fit_claims:
+                fc_id = str(fc.get("id"))
+                fc_str = str(fc["claim"])
+                for r_rank, did in enumerate(verifier.retrieve_stage1_docs(fc_str, top_m=3)):
+                    lo, hi = verifier.doc_sent_spans[did]
+                    if lo >= hi:
+                        continue
+                    cp = verifier.verify_candidate_sentences(
+                        fc_str,
+                        verifier.all_sentences[lo:hi],
+                        title=verifier.all_sent_titles[lo],
+                        top_k=3,
+                    )
+                    p_sup = float(cp.probabilities["SUPPORT"])
+                    p_con = float(cp.probabilities["CONTRADICT"])
+                    non_nei = p_sup + p_con
+                    top_rr = cp.top_rationale_scores[0] if cp.top_rationale_scores else 0.0
+                    doc_conf = 0.55 * non_nei + 0.45 * top_rr - 0.04 * float(r_rank)
+                    d_lab = "CONTRADICT" if p_con > p_sup else "SUPPORT"
+                    pairs_idx_sc = list(zip(cp.top_rationale_indices, cp.top_rationale_scores))
+                    fit_doc_cands.append((fc_id, str(did), d_lab, doc_conf, pairs_idx_sc))
+
+            best_off_f1 = -1.0
+            best_doc_th = verifier.official_doc_non_nei_threshold
+            for cand_th in (0.52, 0.58, 0.64, 0.68, 0.72, 0.76):
+                trial_preds: dict[str, dict[str, dict[str, Any]]] = {}
+                for fc_id, did_s, d_lab, d_conf, idx_sc in fit_doc_cands:
+                    if d_conf < cand_th:
+                        continue
+                    s_sel = [ix for ix, sc in idx_sc if sc >= 0.48][:2]
+                    if not s_sel and idx_sc:
+                        s_sel = [idx_sc[0][0]]
+                    trial_preds.setdefault(fc_id, {})[did_s] = {
+                        "label": d_lab,
+                        "sentences": s_sel,
+                    }
+                off_m = compute_official_scifact_metrics(fit_claims, trial_preds, max_sentences_per_doc=3)
+                score_f1 = 0.5 * off_m["abstract_label_only"]["f1"] + 0.5 * off_m["sentence_label"]["f1"]
+                if score_f1 > best_off_f1:
+                    best_off_f1 = score_f1
+                    best_doc_th = cand_th
+            verifier.official_doc_non_nei_threshold = best_doc_th
 
         train_id_digest = hashlib.sha256(
             ",".join(sorted(str(c.get("id", "")) for c in train_claims)).encode("utf-8")
@@ -2061,8 +2349,46 @@ class FrontierHybridVerifier:
             "svd_components": verifier.sent_svd.n_components,
             "alpha": verifier.alpha,
             "conformal_calibration": conformal_summary,
+            "candidate_conformal_calibration": cand_conformal_summary,
+            "conflict_threshold": round(float(verifier.conflict_threshold), 6),
         }
         return verifier
+
+    def save_calibrator(self, path: str | Path) -> Path:
+        """Save compact Stage-2 reranker, calibrated conformal stance heads, and conflict threshold."""
+        payload = {
+            "schema_version": "lab-ask-why-calibrator/v1",
+            "reranker": self.reranker.to_dict(),
+            "stance_classifier": self.stance_classifier.to_calibrator_dict(),
+            "candidate_stance_classifier": self.candidate_stance_classifier.to_calibrator_dict(),
+            "conflict_threshold": round(float(self.conflict_threshold), 8),
+            "training_provenance": dict(self.training_provenance),
+        }
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return dest
+
+    def apply_calibrator_file(self, path: str | Path) -> "FrontierHybridVerifier":
+        """Load saved Stage-2 reranker and calibrated Mondrian stance heads onto `self`."""
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if "reranker" in payload:
+            self.reranker = CrossFeatureReranker.from_dict(payload["reranker"])
+        if "stance_classifier" in payload:
+            self.stance_classifier = SplitConformalStanceClassifier.from_calibrator_dict(
+                payload["stance_classifier"]
+            )
+        if "candidate_stance_classifier" in payload:
+            self.candidate_stance_classifier = SplitConformalStanceClassifier.from_calibrator_dict(
+                payload["candidate_stance_classifier"]
+            )
+        else:
+            self.candidate_stance_classifier = self.stance_classifier
+        if "conflict_threshold" in payload:
+            self.conflict_threshold = float(payload["conflict_threshold"])
+        if "training_provenance" in payload and isinstance(payload["training_provenance"], Mapping):
+            self.training_provenance = dict(payload["training_provenance"])
+        return self
 
     def _resolve_doc_key(self, raw_doc_id: Any) -> Any | None:
         if raw_doc_id in self.doc_sent_spans:
@@ -2074,35 +2400,234 @@ class FrontierHybridVerifier:
             return int(s_id)
         return None
 
-    def _stance_features_for_doc(
+    def _stance_features_for_candidate_sentences(
         self,
         claim: str,
-        doc_id: Any,
+        sentences: Sequence[str],
         *,
+        title: str = "",
         top_k: int = 3,
     ) -> tuple[np.ndarray, float, float]:
-        span = self.doc_sent_spans[doc_id]
-        gids = list(range(span[0], span[1]))
-        sents = [self.all_sentences[g] for g in gids]
-        if not sents:
+        """Extract candidate-sentence stance features identically at fit, calibration, and test time."""
+        clean_sents = [str(s) for s in sentences if str(s).strip()]
+        if not clean_sents:
             return _extract_stance_feature_vector(
                 claim, [], np.zeros((0, 26)), {}, np.zeros(0), top_k=top_k
             )
-        loc_pos = [self.all_sent_local_pos[g] for g in gids]
-        titles = [self.all_sent_titles[g] for g in gids]
+        loc_pos = [(j, len(clean_sents)) for j in range(len(clean_sents))]
+        titles = [title] * len(clean_sents)
         f_mat, chans = extract_candidate_rerank_matrix(
             claim,
-            sents,
+            clean_sents,
             bm25=self.sent_bm25,
             svd_index=self.sent_svd,
-            subword_index=self.sent_subword_idx,
-            entity_index=self.sent_entity_idx,
-            sent_global_ids=gids,
+            subword_index=None,
+            entity_index=None,
+            sent_global_ids=None,
             local_positions=loc_pos,
             titles=titles,
         )
         r_probs = self.reranker.score_features(f_mat)
-        return _extract_stance_feature_vector(claim, sents, f_mat, chans, r_probs, top_k=top_k)
+        return _extract_stance_feature_vector(claim, clean_sents, f_mat, chans, r_probs, top_k=top_k)
+
+    def score_bilateral_conflict(
+        self,
+        claim: str,
+        passages_or_sentences: Sequence[str],
+    ) -> dict[str, Any]:
+        """Compute Bilateral Cross-Passage Conflict Score:
+
+        `score_conflict = max_{i != j} min(P(SUPPORT | claim, u_i), P(CONTRADICT | claim, u_j))`
+        combining (a) relevance-gated explicit lexical/directional polarity opposition across
+        distinct sentences and (b) cross-passage counterfactual entity/numeric substitution
+        when distinct passages share a strong subject-predicate anchor yet omit a specific
+        target entity/value affirmed by another passage.
+        """
+        raw_items = [str(x).strip() for x in passages_or_sentences if str(x).strip()]
+        doc_split_re = re.compile(r"(?=\bDocument(?:\s+\d+)?\s*:)")
+        if len(raw_items) == 1:
+            doc_blocks = [d.strip() for d in doc_split_re.split(raw_items[0]) if d.strip()]
+            has_multi_passage = len(doc_blocks) >= 2
+            passages = doc_blocks if has_multi_passage else raw_items
+        else:
+            # Distinguish multi-passage blocks from a flat sentence list of one abstract
+            avg_words = float(np.mean([len(x.split()) for x in raw_items])) if raw_items else 0.0
+            has_multi_passage = len(raw_items) <= 6 and avg_words >= 32.0
+            passages = raw_items
+
+        # Flatten sentences while recording parent passage index
+        all_sents: list[str] = []
+        sent_passage_id: list[int] = []
+        for p_idx, p_txt in enumerate(passages):
+            if has_multi_passage:
+                parts = [
+                    s.strip()
+                    for line in p_txt.splitlines()
+                    for s in re.split(r"(?<=[.!?])\s+", line)
+                    if s.strip()
+                ]
+            else:
+                parts = [p_txt]
+            for s in parts:
+                all_sents.append(s)
+                sent_passage_id.append(p_idx)
+
+        if len(all_sents) < 2:
+            return {
+                "conflict_score": 0.0,
+                "is_conflict": False,
+                "max_support_prob": 0.0,
+                "max_contradict_prob": 0.0,
+            }
+
+        loc_pos = [(j, len(all_sents)) for j in range(len(all_sents))]
+        f_mat, chans = extract_candidate_rerank_matrix(
+            claim,
+            all_sents,
+            bm25=self.sent_bm25,
+            svd_index=self.sent_svd,
+            subword_index=None,
+            entity_index=None,
+            sent_global_ids=None,
+            local_positions=loc_pos,
+            titles=None,
+        )
+        r_probs = self.reranker.score_features(f_mat)
+        idf_cov = chans["idf_cov"]
+        bm25_norm = chans["bm25_norm"]
+        neg_xor = chans["neg_xor"]
+        dir_opp = chans["dir_opp"]
+        dir_same = chans["dir_same"]
+        num_mis = chans["num_mismatch"]
+
+        n_s = len(all_sents)
+        p_sup_s = np.zeros(n_s, dtype=np.float64)
+        p_con_s = np.zeros(n_s, dtype=np.float64)
+
+        for i, s_txt in enumerate(all_sents):
+            prof = _sentence_profile(s_txt)
+            has_intro = prof[8]
+            if has_intro and i == 0:
+                continue
+            pol = classify_rationale_polarity(claim, s_txt)
+            rel = max(float(r_probs[i]), 0.65 * float(idf_cov[i]) + 0.35 * float(bm25_norm[i]))
+            if float(idf_cov[i]) < 0.30:
+                continue
+            con_cue = (
+                (0.55 if pol == "CONTRADICT" else 0.0)
+                + 0.45 * float(neg_xor[i])
+                + 0.50 * min(1.0, float(dir_opp[i]))
+                + 0.35 * float(num_mis[i])
+            )
+            if con_cue >= 0.50:
+                p_con_s[i] = min(1.0, rel * min(1.0, con_cue))
+            elif pol == "SUPPORT":
+                sup_cue = min(1.0, 0.92 + 0.08 * min(1.0, float(dir_same[i])))
+                p_sup_s[i] = min(1.0, rel * sup_cue)
+
+        best_explicit = 0.0
+        for i in range(n_s):
+            if p_sup_s[i] <= 0.0:
+                continue
+            for j in range(n_s):
+                if i == j or p_con_s[j] <= 0.0:
+                    continue
+                cand = min(float(p_sup_s[i]), float(p_con_s[j]))
+                if cand > best_explicit:
+                    best_explicit = cand
+
+        # Cross-passage counterfactual entity/value substitution score when >= 2 distinct passages
+        best_subst = 0.0
+        if has_multi_passage and len(passages) >= 2:
+            q_toks = list(
+                dict.fromkeys(
+                    t
+                    for t in tokenize(claim)
+                    if t not in _NEGATION_TOKENS and t not in {"proposed", "answer"}
+                )
+            )
+            q_idfs = np.array(
+                [self.sent_bm25.idf.get(t, self.sent_bm25.default_idf) for t in q_toks],
+                dtype=np.float64,
+            )
+            q_tot_idf = float(np.sum(q_idfs)) if q_idfs.size > 0 else 1.0
+            pass_toks = [
+                [t for t in tokenize(p) if t not in _NEGATION_TOKENS]
+                for p in passages
+            ]
+            pass_matched: list[set[int]] = []
+            for p_t in pass_toks:
+                m_set = {
+                    qi
+                    for qi, qt in enumerate(q_toks)
+                    if p_t and max((_token_similarity(qt, pt) for pt in p_t), default=0.0) >= 0.75
+                }
+                pass_matched.append(m_set)
+
+            for a in range(len(passages)):
+                ma = pass_matched[a]
+                if not ma:
+                    continue
+                sup_cov = float(np.sum(q_idfs[list(ma)])) / q_tot_idf
+                if sup_cov < 0.60:
+                    continue
+                for b in range(len(passages)):
+                    if a == b:
+                        continue
+                    mb = pass_matched[b]
+                    shared = ma & mb
+                    missing = ma - mb
+                    if len(shared) < 2 or not missing:
+                        continue
+                    # Verify missing claim entity is genuinely absent from passage b
+                    truly_absent = all(
+                        max(
+                            (_token_similarity(q_toks[mi], pt) for pt in pass_toks[b]),
+                            default=0.0,
+                        )
+                        < 0.45
+                        for mi in missing
+                    )
+                    if not truly_absent:
+                        continue
+                    # Require passage b to introduce distinct non-claim content tokens in the anchor sentence
+                    b_sents_idx = [si for si, pid in enumerate(sent_passage_id) if pid == b]
+                    best_anchor_sent_ov = 0.0
+                    has_alt_entity = False
+                    q_set_all = set(q_toks)
+                    for si in b_sents_idx:
+                        stoks = [t for t in tokenize(all_sents[si]) if t not in _NEGATION_TOKENS]
+                        sh_in_s = sum(
+                            1
+                            for qi in shared
+                            if any(_token_similarity(q_toks[qi], st) >= 0.75 for st in stoks)
+                        )
+                        if sh_in_s >= 2:
+                            ov = float(sh_in_s) / float(len(shared))
+                            if ov > best_anchor_sent_ov:
+                                best_anchor_sent_ov = ov
+                            if any(
+                                max((_token_similarity(qt, st) for qt in q_set_all), default=0.0) < 0.40
+                                for st in stoks
+                            ):
+                                has_alt_entity = True
+                    if not has_alt_entity or best_anchor_sent_ov < 0.50:
+                        continue
+                    anchor_idf_frac = float(np.sum(q_idfs[list(shared)])) / q_tot_idf
+                    if anchor_idf_frac < 0.30:
+                        continue
+                    con_subst = min(1.0, 0.92 * min(1.0, anchor_idf_frac / 0.45) * best_anchor_sent_ov)
+                    cand_sub = min(sup_cov, con_subst)
+                    if cand_sub > best_subst:
+                        best_subst = cand_sub
+
+        score = max(best_explicit, best_subst)
+        return {
+            "conflict_score": float(score),
+            "is_conflict": bool(score >= self.conflict_threshold),
+            "max_support_prob": float(max(float(np.max(p_sup_s)), best_subst)),
+            "max_contradict_prob": float(max(float(np.max(p_con_s)), best_subst)),
+        }
 
     def _stance_features_for_open_claim(
         self,
@@ -2239,17 +2764,27 @@ class FrontierHybridVerifier:
         s_vec, sup_m, con_m = _extract_stance_feature_vector(
             claim, clean_sents, f_mat, chans, r_probs, top_k=top_k
         )
-        probs, is_conf = self.candidate_stance_classifier.predict_proba_from_features(
+        probs, _ = self.candidate_stance_classifier.predict_proba_from_features(
             s_vec, sup_mass=sup_m, con_mass=con_m
         )
-        pset = self.candidate_stance_classifier.prediction_set_from_probs(probs, alpha_override=alpha)
+        pset = list(
+            self.candidate_stance_classifier.prediction_set_from_probs(probs, alpha_override=alpha)
+        )
+        b_conf = self.score_bilateral_conflict(claim, clean_sents)
+        is_conf = bool(b_conf["is_conflict"])
+        if is_conf and (alpha is None or float(alpha) <= 0.20):
+            for req_lab in ("SUPPORT", "CONTRADICT"):
+                if req_lab not in pset:
+                    pset.append(req_lab)
+            pset = [lab for lab in STANCE_LABELS if lab in pset]
+
         pred_lab = STANCE_LABELS[int(np.argmax(probs))]
         return ConformalStancePrediction(
             predicted_label=pred_lab,
             probabilities={STANCE_LABELS[i]: float(probs[i]) for i in range(3)},
             conformal_set=pset,
             alpha=float(alpha if alpha is not None else self.candidate_stance_classifier.alpha),
-            is_contested_conflict=is_conf or ("SUPPORT" in pset and "CONTRADICT" in pset),
+            is_contested_conflict=is_conf,
             top_rationale_indices=top_idx,
             top_rationale_scores=[float(r_probs[i]) for i in top_idx],
         )
@@ -2320,17 +2855,19 @@ class FrontierHybridVerifier:
         s_vec, sup_m, con_m = _extract_stance_feature_vector(
             claim, sents, f_mat, chans, r_probs, top_k=sent_top_k
         )
-        probs, is_conf = self.stance_classifier.predict_proba_from_features(
+        probs, _ = self.stance_classifier.predict_proba_from_features(
             s_vec, sup_mass=sup_m, con_mass=con_m
         )
         pset = self.stance_classifier.prediction_set_from_probs(probs, alpha_override=alpha)
         pred_lab = STANCE_LABELS[int(np.argmax(probs))]
+        top_sent_texts = [str(x["sentence"]) for x in ranked_sents]
+        b_conf = self.score_bilateral_conflict(claim, top_sent_texts)
         stance_pred = ConformalStancePrediction(
             predicted_label=pred_lab,
             probabilities={STANCE_LABELS[i]: float(probs[i]) for i in range(3)},
             conformal_set=pset,
             alpha=float(alpha if alpha is not None else self.stance_classifier.alpha),
-            is_contested_conflict=is_conf or ("SUPPORT" in pset and "CONTRADICT" in pset),
+            is_contested_conflict=bool(b_conf["is_conflict"]),
             top_rationale_indices=[int(x["sent_idx"]) for x in ranked_sents],
             top_rationale_scores=[float(x["rerank_score"]) for x in ranked_sents],
         )
@@ -2371,6 +2908,9 @@ class FrontierHybridVerifier:
         bm25_stance_true: list[str] = []
         bm25_stance_pred: list[str] = []
         svd_stance_pred: list[str] = []
+        cand_conformal_covered: list[bool] = []
+        cand_conformal_sizes: list[int] = []
+        cand_conformal_by_class: dict[str, list[bool]] = {lab: [] for lab in STANCE_LABELS}
 
         for p in pairs:
             did = self._resolve_doc_key(p["doc_id"])
@@ -2403,11 +2943,27 @@ class FrontierHybridVerifier:
             rrf_ranks.append(rrf_ord)
             hybrid_ranks.append(hyb_ord)
 
-            bm25_stance_true.append(canonicalize_stance_label(p["label"]))
+            g_pair_lab = canonicalize_stance_label(p["label"])
+            bm25_stance_true.append(g_pair_lab)
             b_pol = classify_rationale_polarity(p["claim"], sents[b_ord[0]]) if b_ord else "NEUTRAL"
             bm25_stance_pred.append("CONTRADICT" if b_pol == "CONTRADICT" else ("SUPPORT" if b_pol == "SUPPORT" else "NEI"))
             s_pol = classify_rationale_polarity(p["claim"], sents[s_ord[0]]) if s_ord else "NEUTRAL"
             svd_stance_pred.append("CONTRADICT" if s_pol == "CONTRADICT" else ("SUPPORT" if s_pol == "SUPPORT" else "NEI"))
+
+            c_pred = self.verify_candidate_sentences(p["claim"], sents, title=p["title"], top_k=top_k)
+            c_cov = g_pair_lab in c_pred.conformal_set
+            cand_conformal_covered.append(c_cov)
+            cand_conformal_sizes.append(len(c_pred.conformal_set))
+            cand_conformal_by_class[g_pair_lab].append(c_cov)
+
+        for np_item in noinfo_pairs:
+            c_pred_ni = self.verify_candidate_sentences(
+                np_item["claim"], np_item["sents"], title=np_item["title"], top_k=top_k
+            )
+            c_cov_ni = "NEI" in c_pred_ni.conformal_set
+            cand_conformal_covered.append(c_cov_ni)
+            cand_conformal_sizes.append(len(c_pred_ni.conformal_set))
+            cand_conformal_by_class["NEI"].append(c_cov_ni)
 
         # Evaluate 3-way stance & Split Conformal coverage across ALL claims (`SUPPORT`/`CONTRADICT`/`NEI`)
         y_true_all: list[str] = []
@@ -2428,8 +2984,11 @@ class FrontierHybridVerifier:
 
         bm25_doc_hits: list[float] = []
         svd_doc_hits: list[float] = []
+        bm25_official_preds: dict[str, dict[str, dict[str, Any]]] = {}
+        hybrid_official_preds: dict[str, dict[str, dict[str, Any]]] = {}
 
         for c in claims:
+            cid_str = str(c.get("id"))
             claim_str = str(c["claim"])
             ev = c.get("evidence") or {}
             if not ev:
@@ -2445,18 +3004,39 @@ class FrontierHybridVerifier:
             y_true_all.append(gold_lab)
 
             # Baseline open-corpus doc recall comparisons (BM25 vs Dense-SVD vs Hybrid RRF)
+            b_ranked_doc_pos = self.doc_bm25.rank_candidates(claim_str, top_k=doc_top_m)
             if ev:
                 gold_docs = {str(did) for did in ev.keys()}
-                b_top_docs = {
-                    str(self.doc_ids[i])
-                    for i in self.doc_bm25.rank_candidates(claim_str, top_k=doc_top_m)
-                }
+                b_top_docs = {str(self.doc_ids[i]) for i in b_ranked_doc_pos}
                 s_top_docs = {
                     str(self.doc_ids[int(i)])
                     for i in np.argsort(-self.doc_svd.cosine_scores(claim_str), kind="stable")[:doc_top_m]
                 }
                 bm25_doc_hits.append(len(gold_docs & b_top_docs) / len(gold_docs))
                 svd_doc_hits.append(len(gold_docs & s_top_docs) / len(gold_docs))
+
+            # Build official SciFact predictions for BM25 baseline
+            b_doc_map: dict[str, dict[str, Any]] = {}
+            for d_pos in b_ranked_doc_pos:
+                did = self.doc_ids[d_pos]
+                lo, hi = self.doc_sent_spans[did]
+                if lo >= hi:
+                    continue
+                gids_d = list(range(lo, hi))
+                s_norm = self.sent_bm25.score_indexed_normalized(claim_str, gids_d)
+                if float(np.max(s_norm)) < 0.35:
+                    continue
+                s_ord_d = [int(i) for i in np.argsort(-s_norm, kind="stable") if float(s_norm[int(i)]) >= 0.30][:3]
+                if not s_ord_d:
+                    s_ord_d = [int(np.argmax(s_norm))]
+                pol_d = classify_rationale_polarity(claim_str, self.all_sentences[lo + s_ord_d[0]])
+                if pol_d == "NEUTRAL":
+                    continue
+                b_doc_map[str(did)] = {
+                    "label": "CONTRADICT" if pol_d == "CONTRADICT" else "SUPPORT",
+                    "sentences": s_ord_d[:3],
+                }
+            bm25_official_preds[cid_str] = b_doc_map
 
             # Full open-corpus 2-stage Hybrid + Reranker + Split Conformal verification
             res = self.verify_claim_open_corpus(
@@ -2471,6 +3051,40 @@ class FrontierHybridVerifier:
             conformal_sizes.append(len(pset))
             if len(pset) >= 2:
                 multi_label_sets += 1
+
+            # Build official SciFact predictions for Sparse Hybrid verifier across top-3 retrieved docs
+            h_doc_map: dict[str, dict[str, Any]] = {}
+            for r_rank, did in enumerate(res["top_doc_ids"][:3]):
+                lo, hi = self.doc_sent_spans[did]
+                if lo >= hi:
+                    continue
+                d_sents = self.all_sentences[lo:hi]
+                d_title = self.all_sent_titles[lo]
+                c_pred_d = self.verify_candidate_sentences(claim_str, d_sents, title=d_title, top_k=3)
+                if not c_pred_d.top_rationale_scores:
+                    continue
+                p_sup_d = float(c_pred_d.probabilities["SUPPORT"])
+                p_con_d = float(c_pred_d.probabilities["CONTRADICT"])
+                non_nei_d = p_sup_d + p_con_d
+                doc_conf_d = (
+                    0.55 * non_nei_d
+                    + 0.45 * float(c_pred_d.top_rationale_scores[0])
+                    - 0.04 * float(r_rank)
+                )
+                if doc_conf_d < self.official_doc_non_nei_threshold:
+                    continue
+                sel_s = [
+                    idx
+                    for idx, sc in zip(c_pred_d.top_rationale_indices, c_pred_d.top_rationale_scores)
+                    if sc >= 0.48
+                ][:2]
+                if not sel_s:
+                    sel_s = [c_pred_d.top_rationale_indices[0]]
+                h_doc_map[str(did)] = {
+                    "label": "CONTRADICT" if p_con_d > p_sup_d else "SUPPORT",
+                    "sentences": sel_s,
+                }
+            hybrid_official_preds[cid_str] = h_doc_map
 
             # Lexical BM25 and Dense-SVD 3-way baselines on open-corpus retrieval
             b_norm_max = float(np.max(self.sent_bm25.score_indexed_normalized(claim_str)))
@@ -2524,6 +3138,25 @@ class FrontierHybridVerifier:
                 f"rationale_set_recall@{top_k}": rationale_set_recall_at(ranks, pairs, top_k),
             }
 
+        maj_3way = majority_class_stance_baseline(y_true_all, eval_labels=STANCE_LABELS)
+        single_label_sets = sum(1 for sz in conformal_sizes if sz == 1)
+        open_cov_detail = {
+            lab: {
+                "n": len(vals),
+                "coverage": float(np.mean(vals)) if vals else float("nan"),
+                "wilson_95_ci": list(wilson_score_interval(int(sum(vals)), len(vals))),
+            }
+            for lab, vals in conformal_by_class.items()
+        }
+        cand_cov_detail = {
+            lab: {
+                "n": len(vals),
+                "coverage": float(np.mean(vals)) if vals else float("nan"),
+                "wilson_95_ci": list(wilson_score_interval(int(sum(vals)), len(vals))),
+            }
+            for lab, vals in cand_conformal_by_class.items()
+        }
+
         return {
             "total_claims": len(claims),
             "evidence_claims": len(ev_claims),
@@ -2550,8 +3183,20 @@ class FrontierHybridVerifier:
                 "hybrid_reranker_sentence_mrr": float(np.mean(open_sent_mrr)) if open_sent_mrr else float("nan"),
                 "reranker_auroc_vs_nei": compute_auroc(ev_max_rerank, ni_max_rerank),
             },
+            "official_scifact_metrics": {
+                "bm25": compute_official_scifact_metrics(claims, bm25_official_preds, max_sentences_per_doc=3),
+                "hybrid_reranker": compute_official_scifact_metrics(
+                    claims, hybrid_official_preds, max_sentences_per_doc=3
+                ),
+            },
             "stance_verification_3way": {
+                **maj_3way,
                 "bm25_macro_f1": macro_f1_score(y_true_all, y_pred_bm25_3way, labels=STANCE_LABELS),
+                "bm25_accuracy": (
+                    float(np.mean([yt == yp for yt, yp in zip(y_true_all, y_pred_bm25_3way)]))
+                    if y_true_all
+                    else float("nan")
+                ),
                 "dense_svd_macro_f1": macro_f1_score(y_true_all, y_pred_svd_3way, labels=STANCE_LABELS),
                 "hybrid_reranker_macro_f1": macro_f1_score(y_true_all, y_pred_hybrid, labels=STANCE_LABELS),
                 "hybrid_reranker_accuracy": float(
@@ -2570,13 +3215,43 @@ class FrontierHybridVerifier:
                 "target_coverage": 1.0 - self.stance_classifier.alpha,
                 "alpha": self.stance_classifier.alpha,
                 "empirical_coverage": float(np.mean(conformal_covered)) if conformal_covered else float("nan"),
+                "empirical_wilson_95_ci": list(
+                    wilson_score_interval(int(sum(conformal_covered)), len(conformal_covered))
+                ),
                 "avg_set_size": float(np.mean(conformal_sizes)) if conformal_sizes else float("nan"),
+                "single_label_set_rate": (
+                    float(single_label_sets) / float(len(claims)) if claims else 0.0
+                ),
                 "multi_label_set_rate": (
                     float(multi_label_sets) / float(len(claims)) if claims else 0.0
                 ),
                 "coverage_by_class": {
                     lab: (float(np.mean(vals)) if vals else float("nan"))
                     for lab, vals in conformal_by_class.items()
+                },
+                "coverage_by_class_detail": open_cov_detail,
+                "candidate_abstract_conformal_90": {
+                    "empirical_coverage": (
+                        float(np.mean(cand_conformal_covered))
+                        if cand_conformal_covered
+                        else float("nan")
+                    ),
+                    "avg_set_size": (
+                        float(np.mean(cand_conformal_sizes))
+                        if cand_conformal_sizes
+                        else float("nan")
+                    ),
+                    "single_label_set_rate": (
+                        float(sum(1 for sz in cand_conformal_sizes if sz == 1))
+                        / float(len(cand_conformal_sizes))
+                        if cand_conformal_sizes
+                        else 0.0
+                    ),
+                    "coverage_by_class": {
+                        lab: (float(np.mean(vals)) if vals else float("nan"))
+                        for lab, vals in cand_conformal_by_class.items()
+                    },
+                    "coverage_by_class_detail": cand_cov_detail,
                 },
             },
             "training_provenance": dict(self.training_provenance),

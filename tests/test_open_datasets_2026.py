@@ -21,6 +21,7 @@ from lab_ask_why import (
     OpenDatasetSpec,
     adapt_record,
     adapt_records,
+    build_conflictbank_claim_evidence_pairs,
     build_corpus_and_claims_from_records,
     contains_eval_canary,
     enforce_dataset_guard,
@@ -600,3 +601,71 @@ def test_normalize_veracity_label_variants_and_zero_cjk_in_repo() -> None:
     for path in checked_files:
         text = path.read_text(encoding="utf-8")
         assert CJK_RE.search(text) is None, f"Found CJK character in {path}"
+
+
+def test_issue_34_probe_normalized_record_never_reads_gold_label() -> None:
+    sents = [
+        "Patients did not attend follow-up visits.",
+        "Enrollment closed early in 2019.",
+    ]
+    outputs = []
+    for gold_label in ("SUPPORT", "CONTRADICT", "NOINFO"):
+        rec = NormalizedClaimRecord(
+            dataset_id="pubmedqa",
+            record_id="leak-check-1",
+            claim="Drug A does not reduce mortality.",
+            evidence_sentences=sents,
+            label=gold_label,
+        )
+        probe = probe_normalized_record(rec, purpose="eval", top_k=3)
+        # NEUTRAL sentences must never enter supporting or contradicting lists
+        assert probe.supporting_rationales == []
+        assert probe.contradicting_rationales == []
+        assert probe.epistemic_status == "INSUFFICIENT_EVIDENCE"
+        outputs.append(probe.to_dict())
+
+    assert outputs[0] == outputs[1] == outputs[2]
+
+
+def test_issue_34_conflictbank_claim_evidence_labels_self_support_and_cross_contradict() -> None:
+    fixture_rows = [
+        {
+            "id": "P108",
+            "subject": "Kevin King",
+            "category": "default",
+            "claim": "Kevin King worked for University of Texas Health Science Center at San Antonio.",
+            "evidence": (
+                "Dr. Kevin King served on the faculty of the University of Texas Health "
+                "Science Center at San Antonio throughout his clinical career."
+            ),
+        },
+        {
+            "id": "P108",
+            "subject": "Kevin King",
+            "category": "temporal_conflict",
+            "claim": "Kevin King worked for University of Malaga from 2034 to 2036.",
+            "evidence": (
+                "In the summer of 2034, Dr. Kevin King joined the University of Malaga, "
+                "his new employer for the next two years."
+            ),
+        },
+    ]
+
+    # Each row's passage was written to support its own claim -> both adapt to SUPPORT
+    rec_default = adapt_record("conflictbank", fixture_rows[0], purpose="eval")
+    rec_conflict_cat = adapt_record("conflictbank", fixture_rows[1], purpose="eval")
+    assert rec_default.label == "SUPPORT"
+    assert rec_conflict_cat.label == "SUPPORT"
+
+    # Cross-subject pairing builds true CONTRADICT pairs (default claim vs conflict passage)
+    paired = build_conflictbank_claim_evidence_pairs(
+        fixture_rows, include_cross_subject_contradictions=True, purpose="eval"
+    )
+    assert len(paired) == 3
+    self_recs = [r for r in paired if r.metadata.get("pairing") == "self_paired"]
+    cross_recs = [r for r in paired if r.metadata.get("pairing") == "cross_subject_conflict"]
+    assert len(self_recs) == 2 and all(r.label == "SUPPORT" for r in self_recs)
+    assert len(cross_recs) == 1
+    assert cross_recs[0].label == "CONTRADICT"
+    assert "Texas Health Science Center" in cross_recs[0].claim
+    assert any("Malaga" in s for s in cross_recs[0].evidence_sentences)

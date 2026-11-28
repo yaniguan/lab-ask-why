@@ -1,14 +1,15 @@
 """Auto-Lab 15-repository wire node for lab-ask-why (Layer L6 Epistemic Brain).
 
 Connects upstream protocol/sensory spans from ``lab-ears`` (L2) to symmetric
-Okapi BM25 + hybrid subword/SVD rationale retrieval, Split-Conformal 3-way stance
-sets, Socratic ``why_questions`` framing, and structured control-well synthesis
-before calibrating trust regions in ``lab-decide`` (L6), with post-run causal
-attribution certificates closed through ``lab-attrib`` (L4).
+Okapi BM25 + hybrid subword/SVD rationale retrieval, calibrated Split-Conformal
+3-way stance sets, Socratic ``why_questions`` framing, and structured control-well
+synthesis before calibrating trust regions in ``lab-decide`` (L6), with post-run
+causal attribution certificates closed through ``lab-attrib`` (L4).
 """
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import re
 import sys
@@ -26,11 +27,12 @@ for _candidate_path in (str(_SRC_DIR), str(REPO_DIR)):
     if _candidate_path not in sys.path:
         sys.path.insert(0, _candidate_path)
 
-from lab_ask_why.bm25 import BM25  # noqa: E402
+from lab_ask_why.bm25 import BM25, tokenize  # noqa: E402
 from lab_ask_why.frontier_verifier import FrontierHybridVerifier  # noqa: E402
-from lab_ask_why.retrieval import classify_rationale_polarity  # noqa: E402
+from lab_ask_why.retrieval import _NEGATION_TOKENS, classify_rationale_polarity  # noqa: E402
 from lab_ask_why.schema import (  # noqa: E402
     DiscriminatingObservable,
+    check_ask_why_permille,
     to_permille_floor,
 )
 from lab_ask_why.socratic import (  # noqa: E402
@@ -40,8 +42,8 @@ from lab_ask_why.socratic import (  # noqa: E402
     why_questions,
 )
 
-# Built-in 6-sentence offline wet-lab solubility & protocol mini-corpus
-# (3 supporting + 3 countervailing/contradicting sentences; zero network needed).
+# Built-in 6-sentence offline wet-lab solubility & protocol mini-corpus.
+# Used ONLY when the caller explicitly passes `allow_synthetic_fixture=True` or `use_demo_corpus=True`.
 DEFAULT_WETLAB_EVIDENCE_SENTENCES: tuple[str, ...] = (
     "Buffered aqueous incubation of 100 uL candidate solution at 25 C to 37 C for 15 min with gentle rpm agitation increases equilibrium small-molecule aspirin solubility and reproducible 96-well plate absorbance readout.",
     "Controlled microliter liquid transfer into pH-buffered cosolvent wells enhances dissolution kinetics and preserves parent ester assay stability across standard incubation windows.",
@@ -54,9 +56,10 @@ DEFAULT_WETLAB_EVIDENCE_SENTENCES: tuple[str, ...] = (
 _DEFAULT_FALLBACK_CLAIM = (
     "Buffered aqueous incubation protocol achieves reproducible small-molecule aspirin solubility"
 )
-_DEFAULT_WETLAB_QUERY_ANCHOR = (
-    "aqueous solubility aspirin incubation protocol transfer temperature stability"
+DEFAULT_CALIBRATOR_PATH = (
+    REPO_DIR / "src" / "lab_ask_why" / "resources" / "scifact_wire_calibrator.json"
 )
+NOINFO_THRESHOLD = 0.35
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SHA256_KEYS = ("sha256", "ledger_entry_sha256", "entry_sha256", "entry_hash")
@@ -68,7 +71,21 @@ _VALID_OUTCOMES = frozenset(
         "AMBIGUOUS_CHARACTERIZATION",
     }
 )
-_ALLOWED_DATA_SOURCES = frozenset({"real_downloaded", "synthetic_fixture", "caller_provided"})
+_ALLOWED_DATA_SOURCES = frozenset(
+    {"real_downloaded", "synthetic_fixture", "caller_provided", "no_evidence"}
+)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_cached_calibrator_payload(calibrator_path_str: str) -> dict[str, Any] | None:
+    """Load compact `SciFact train` (`607`/`202`) calibrator JSON if present on disk."""
+    p = Path(calibrator_path_str)
+    if not p.is_file():
+        return None
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        return None
+    return dict(payload)
 
 
 def _canonicalize_attribution_outcome(raw_outcome: Any) -> str:
@@ -117,7 +134,7 @@ def _halt_fail_closed(
     halt_reason: str,
     summary: str,
     *,
-    data_source: str = "synthetic_fixture",
+    data_source: str = "caller_provided",
 ) -> dict[str, Any]:
     """Fail-closed helper emitting a clean `BLOCK` packet without raising uncaught exceptions."""
     out["halted"] = True
@@ -127,8 +144,9 @@ def _halt_fail_closed(
         "claim": "",
         "data_source": data_source,
         "epistemic_status": "INSUFFICIENT_EVIDENCE",
-        "conformal_stance_set": ["NEI"],
-        "conformal_alpha": 0.10,
+        "stance_calibrated": False,
+        "conformal_stance_set": None,
+        "conformal_alpha": None,
         "stance_probabilities": {"SUPPORT": 0.0, "CONTRADICT": 0.0, "NEI": 1.0},
         "retrieval_confidence": 0.0,
         "abstain_recommended": True,
@@ -209,15 +227,22 @@ def _resolve_claim_text(goal_text: str, parsed_spans: Mapping[str, Any]) -> str:
 
 def _normalize_corpus_entries(
     raw_sentences: Sequence[Any] | None,
+    *,
+    allow_synthetic_fixture: bool = False,
 ) -> tuple[list[str], list[str | None], bool, str | None]:
-    """Normalize evidence sentences into `(texts, explicit_polarities, used_builtin, error_msg)`."""
+    """Normalize evidence sentences into `(texts, explicit_polarities, used_builtin, error_msg)`.
+
+    Never falls back to `DEFAULT_WETLAB_EVIDENCE_SENTENCES` unless `allow_synthetic_fixture=True`.
+    """
     if raw_sentences is None:
-        return (
-            list(DEFAULT_WETLAB_EVIDENCE_SENTENCES),
-            [None] * len(DEFAULT_WETLAB_EVIDENCE_SENTENCES),
-            True,
-            None,
-        )
+        if allow_synthetic_fixture:
+            return (
+                list(DEFAULT_WETLAB_EVIDENCE_SENTENCES),
+                [None] * len(DEFAULT_WETLAB_EVIDENCE_SENTENCES),
+                True,
+                None,
+            )
+        return [], [], False, None
 
     texts: list[str] = []
     explicit_polarities: list[str | None] = []
@@ -433,6 +458,13 @@ def _ingest_attribution_feedback(
     return admitted, counts, ambiguous, None
 
 
+def _shared_content_tokens(claim_text: str, sentence_text: str) -> set[str]:
+    """Return shared non-stopword, non-negation content tokens between `claim_text` and `sentence_text`."""
+    c_content = set(tokenize(claim_text)) - _NEGATION_TOKENS
+    s_content = set(tokenize(sentence_text)) - _NEGATION_TOKENS
+    return c_content & s_content
+
+
 def _rank_support_and_contradict(
     claim_text: str,
     bm25_query: str,
@@ -440,17 +472,22 @@ def _rank_support_and_contradict(
     scoring_texts: Sequence[str],
     explicit_polarities: Sequence[str | None],
     *,
-    used_builtin: bool,
     top_k: int = 3,
-) -> tuple[list[str], list[str], float]:
-    """Rank candidate rationale sentences via Okapi BM25 and partition strictly by stance polarity."""
+) -> tuple[list[str], list[str], float, bool]:
+    """Rank candidate rationale sentences via Okapi BM25 and enforce NOINFO & content-word gates."""
     if not sentences:
-        return [], [], 0.0
+        return [], [], 0.0, False
 
     bm25 = BM25(scoring_texts)
-    scores = bm25.score_indexed(bm25_query)
-    norm_scores = bm25.score_indexed_normalized(bm25_query)
-    ranked_indices = bm25.rank_candidates(bm25_query)
+    raw_claim = bm25.score_indexed(claim_text)
+    raw_query = bm25.score_indexed(bm25_query)
+    scores = [max(float(a), float(b)) for a, b in zip(raw_claim, raw_query)]
+
+    norm_claim = bm25.score_indexed_normalized(claim_text)
+    norm_query = bm25.score_indexed_normalized(bm25_query)
+    norm_scores = [max(float(a), float(b)) for a, b in zip(norm_claim, norm_query)]
+
+    ranked_indices = sorted(range(len(sentences)), key=lambda i: (-scores[i], i))
 
     polarities = [
         (
@@ -460,64 +497,70 @@ def _rank_support_and_contradict(
         )
         for idx in range(len(sentences))
     ]
+    has_shared = [
+        bool(_shared_content_tokens(claim_text, scoring_texts[idx]))
+        for idx in range(len(sentences))
+    ]
 
-    # Strictly require 'SUPPORT' vs 'CONTRADICT' so 'NEUTRAL' sentences never leak into support_top
+    # Strictly require >= 1 shared non-stopword content token AND explicit SUPPORT / CONTRADICT polarity
     support_list = [
         sentences[idx]
         for idx in ranked_indices
-        if scores[idx] > 0.0 and polarities[idx] == "SUPPORT"
+        if scores[idx] > 0.0 and has_shared[idx] and polarities[idx] == "SUPPORT"
     ][:top_k]
     contradict_list = [
         sentences[idx]
         for idx in ranked_indices
-        if scores[idx] > 0.0 and polarities[idx] == "CONTRADICT"
+        if scores[idx] > 0.0 and has_shared[idx] and polarities[idx] == "CONTRADICT"
     ][:top_k]
 
-    max_norm = float(max(norm_scores)) if norm_scores.size > 0 else 0.0
+    top_idx = ranked_indices[0] if ranked_indices else 0
+    top_has_shared = bool(has_shared[top_idx]) if sentences else False
+    max_norm = max(norm_scores) if norm_scores else 0.0
 
-    # When using the built-in wet-lab corpus, ensure generic claims with sparse lexical
-    # overlap still ground against the default wet-lab protocol anchor without network I/O.
-    if used_builtin and (not support_list or not contradict_list):
-        augmented_query = f"{bm25_query} {_DEFAULT_WETLAB_QUERY_ANCHOR}".strip()
-        aug_scores = bm25.score_indexed(augmented_query)
-        aug_norm = bm25.score_indexed_normalized(augmented_query)
-        aug_ranked = bm25.rank_candidates(augmented_query)
-        if aug_norm.size > 0:
-            max_norm = max(max_norm, float(max(aug_norm)))
-        if not support_list:
-            support_list = [
-                sentences[idx]
-                for idx in aug_ranked
-                if aug_scores[idx] > 0.0 and polarities[idx] == "SUPPORT"
-            ][:top_k]
-        if not contradict_list:
-            contradict_list = [
-                sentences[idx]
-                for idx in aug_ranked
-                if aug_scores[idx] > 0.0 and polarities[idx] == "CONTRADICT"
-            ][:top_k]
+    # Enforce exact Lean `checkAskWhy` NOINFO floor (>= 350 permille) AND >= 1 shared content token
+    cand_conf = to_permille_floor(max_norm) / 1000.0
+    ask_violation = check_ask_why_permille(
+        cand_conf,
+        noinfo_thresh=NOINFO_THRESHOLD,
+        support_hits=len(support_list),
+        contradict_hits=len(contradict_list),
+        has_discriminating_experiment=True,
+    )
+    if ask_violation is not None or not top_has_shared:
+        return [], [], 0.0, False
 
-    if not support_list and not contradict_list:
-        max_norm = 0.0
-
-    return support_list, contradict_list, max_norm
+    return support_list, contradict_list, cand_conf, True
 
 
 def _compute_conformal_stance_metadata(
     claim_text: str,
     sentences: Sequence[str],
     epistemic_status: str,
-) -> tuple[list[str], dict[str, float]]:
-    """Compute Split Conformal 90% stance set and 3-way probabilities on packet corpus."""
+    *,
+    use_calibrated_stance: bool = True,
+    calibrator_path: Path | None = None,
+) -> tuple[list[str] | None, float | None, bool, dict[str, float]]:
+    """Compute Split Conformal stance set ONLY when calibrated and grounded; never label prior as alpha=0.10."""
     if not sentences or epistemic_status == "INSUFFICIENT_EVIDENCE":
-        return ["NEI"], {"SUPPORT": 0.0, "CONTRADICT": 0.0, "NEI": 1.0}
+        return None, None, False, {"SUPPORT": 0.0, "CONTRADICT": 0.0, "NEI": 1.0}
 
     mini_corpus = {0: {"doc_id": 0, "title": "wire_packet_corpus", "abstract": list(sentences)}}
     verifier = FrontierHybridVerifier(mini_corpus, svd_components=min(8, max(1, len(sentences))))
-    pred = verifier.verify_candidate_sentences(claim_text, sentences, top_k=min(4, len(sentences)))
-    cset = list(pred.conformal_set)
-    probs = dict(pred.probabilities)
 
+    target_cal_path = calibrator_path if calibrator_path is not None else DEFAULT_CALIBRATOR_PATH
+    if use_calibrated_stance and target_cal_path.is_file():
+        verifier.apply_calibrator_file(target_cal_path)
+
+    pred = verifier.verify_candidate_sentences(
+        claim_text, sentences, top_k=min(4, len(sentences))
+    )
+    probs = {k: round(float(v), 6) for k, v in pred.probabilities.items()}
+
+    if not verifier.candidate_stance_classifier.is_calibrated:
+        return None, None, False, probs
+
+    cset = list(pred.conformal_set)
     if epistemic_status == "CONTESTED":
         for req in ("SUPPORT", "CONTRADICT"):
             if req not in cset:
@@ -528,7 +571,7 @@ def _compute_conformal_stance_metadata(
         cset.insert(0, "CONTRADICT")
 
     ordered = [lab for lab in ("SUPPORT", "CONTRADICT", "NEI") if lab in cset]
-    return ordered, probs
+    return ordered, float(verifier.candidate_stance_classifier.alpha), True, probs
 
 
 def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
@@ -555,10 +598,15 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("bottom_reasoning_traces", [])
 
     if not isinstance(out["trace"], list) or not isinstance(out["bottom_reasoning_traces"], list):
-        out["trace"] = list(out["trace"]) if isinstance(out["trace"], Sequence) and not isinstance(out["trace"], (str, bytes)) else []
+        out["trace"] = (
+            list(out["trace"])
+            if isinstance(out["trace"], Sequence) and not isinstance(out["trace"], (str, bytes))
+            else []
+        )
         out["bottom_reasoning_traces"] = (
             list(out["bottom_reasoning_traces"])
-            if isinstance(out["bottom_reasoning_traces"], Sequence) and not isinstance(out["bottom_reasoning_traces"], (str, bytes))
+            if isinstance(out["bottom_reasoning_traces"], Sequence)
+            and not isinstance(out["bottom_reasoning_traces"], (str, bytes))
             else []
         )
         return _halt_fail_closed(
@@ -579,7 +627,13 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         return out
 
     # Strict boolean validation on control flags (never coerce "false" -> True!)
-    for bool_flag in ("suppress_discriminating_experiment", "strict_ask_why"):
+    for bool_flag in (
+        "suppress_discriminating_experiment",
+        "strict_ask_why",
+        "allow_synthetic_fixture",
+        "use_demo_corpus",
+        "use_calibrated_stance",
+    ):
         if bool_flag in out and not isinstance(out[bool_flag], bool):
             return _halt_fail_closed(
                 out,
@@ -630,18 +684,30 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
     raw_spans = out.get("parsed_spans") or {}
     parsed_spans: Mapping[str, Any] = raw_spans if isinstance(raw_spans, Mapping) else {}
 
+    raw_evidence: Sequence[Any] | None = None
     if "evidence_sentences" in out and out["evidence_sentences"] is not None:
-        raw_evidence = out["evidence_sentences"]
-        if not isinstance(raw_evidence, Sequence) or isinstance(raw_evidence, (str, bytes)):
+        ev_field = out["evidence_sentences"]
+        if not isinstance(ev_field, Sequence) or isinstance(ev_field, (str, bytes)):
             return _halt_fail_closed(
                 out,
                 "L6_INVALID_EVIDENCE_SENTENCES",
                 "Packet 'evidence_sentences' must be a list/sequence of strings or mappings.",
             )
-    else:
-        raw_evidence = None
+        raw_evidence = ev_field
+    elif "evidence" in out and out["evidence"] is not None:
+        ev_alt = out["evidence"]
+        if not isinstance(ev_alt, Sequence) or isinstance(ev_alt, (str, bytes)):
+            return _halt_fail_closed(
+                out,
+                "L6_INVALID_EVIDENCE_SENTENCES",
+                "Packet 'evidence' must be a list/sequence of strings or mappings.",
+            )
+        raw_evidence = ev_alt
 
-    sentences, explicit_polarities, used_builtin, ev_err = _normalize_corpus_entries(raw_evidence)
+    allow_synth = bool(out.get("allow_synthetic_fixture", False) or out.get("use_demo_corpus", False))
+    sentences, explicit_polarities, used_builtin, ev_err = _normalize_corpus_entries(
+        raw_evidence, allow_synthetic_fixture=allow_synth
+    )
     if ev_err is not None:
         return _halt_fail_closed(out, "L6_INVALID_EVIDENCE_SENTENCES", ev_err)
 
@@ -654,8 +720,12 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
                 f"Packet 'data_source' must be one of {sorted(_ALLOWED_DATA_SOURCES)}, got {caller_ds!r}.",
             )
         data_source = caller_ds
+    elif used_builtin:
+        data_source = "synthetic_fixture"
+    elif sentences:
+        data_source = "caller_provided"
     else:
-        data_source = "synthetic_fixture" if used_builtin else "caller_provided"
+        data_source = "no_evidence"
 
     claim_text = explicit_claim if explicit_claim is not None else _resolve_claim_text(goal_text, parsed_spans)
     span_context = _extract_span_context(parsed_spans)
@@ -677,14 +747,15 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         sentences.append(disp_text)
         scoring_texts.append(score_blob)
         explicit_polarities.append(pol)
+        if data_source == "no_evidence":
+            data_source = "caller_provided"
 
-    support_list, contradict_list, max_norm_score = _rank_support_and_contradict(
+    support_list, contradict_list, retrieval_confidence, passed_noinfo = _rank_support_and_contradict(
         claim_text,
         bm25_query,
         sentences,
         scoring_texts,
         explicit_polarities,
-        used_builtin=used_builtin,
     )
 
     grounded_context: list[str] = []
@@ -694,7 +765,9 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         if idx < len(contradict_list):
             grounded_context.append(contradict_list[idx])
 
-    if support_list and contradict_list:
+    if not passed_noinfo:
+        epistemic_status = "INSUFFICIENT_EVIDENCE"
+    elif support_list and contradict_list:
         epistemic_status = "CONTESTED"
     elif support_list:
         epistemic_status = "SUPPORTED"
@@ -703,15 +776,26 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
     else:
         epistemic_status = "INSUFFICIENT_EVIDENCE"
 
-    conformal_stance_set, stance_probabilities = _compute_conformal_stance_metadata(
-        claim_text, sentences, epistemic_status
+    use_cal_flag = bool(out.get("use_calibrated_stance", True))
+    raw_cal_path = out.get("calibrator_path")
+    cal_path_override = (
+        Path(str(raw_cal_path))
+        if isinstance(raw_cal_path, str) and raw_cal_path.strip()
+        else None
+    )
+    (
+        conformal_stance_set,
+        conformal_alpha,
+        stance_calibrated,
+        stance_probabilities,
+    ) = _compute_conformal_stance_metadata(
+        claim_text,
+        sentences,
+        epistemic_status,
+        use_calibrated_stance=use_cal_flag,
+        calibrator_path=cal_path_override,
     )
 
-    retrieval_confidence = (
-        to_permille_floor(max_norm_score) / 1000.0
-        if epistemic_status != "INSUFFICIENT_EVIDENCE"
-        else 0.0
-    )
     abstain_recommended = epistemic_status == "INSUFFICIENT_EVIDENCE"
 
     stance_hint = "CONTRADICT" if epistemic_status == "CONTRADICTED" else None
@@ -802,7 +886,7 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
     elif suppress_experiment and ambiguous_characterization:
         out["halted"] = True
         out["halt_reason"] = "L6_AMBIGUOUS_WITHOUT_ORTHOGONAL_ASSAY"
-    elif strict_ask_why and abstain_recommended and not ambiguous_characterization:
+    elif strict_ask_why and abstain_recommended:
         out["halted"] = True
         out["halt_reason"] = "L6_INSUFFICIENT_EVIDENCE_ABSTAIN"
 
@@ -816,8 +900,9 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "claim": claim_text,
         "data_source": data_source,
         "epistemic_status": epistemic_status,
+        "stance_calibrated": stance_calibrated,
         "conformal_stance_set": conformal_stance_set,
-        "conformal_alpha": 0.10,
+        "conformal_alpha": conformal_alpha,
         "stance_probabilities": stance_probabilities,
         "retrieval_confidence": retrieval_confidence,
         "abstain_recommended": abstain_recommended,
@@ -849,22 +934,22 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             summary = (
-                "Blocked packet under strict checkAskWhy mode due to zero-overlap / "
+                "Blocked packet under strict checkAskWhy mode due to below-NOINFO / "
                 "INSUFFICIENT_EVIDENCE rationale retrieval."
             )
-    elif abstain_recommended and not ambiguous_characterization:
+    elif abstain_recommended:
         status = "ABSTAIN"
         summary = (
-            "Zero supporting or contradicting rationales matched claim; recommending "
-            "INSUFFICIENT_EVIDENCE abstention to lab-decide."
+            "Retrieval confidence below 0.35 NOINFO floor or zero shared content words; "
+            "emitting INSUFFICIENT_EVIDENCE abstention."
         )
     else:
         status = "PASS"
         summary = (
             f"Ranked {len(support_list)} support and {len(contradict_list)} contradict BM25 "
-            f"rationales ({epistemic_status}, conformal_set={conformal_stance_set}, "
-            f"data_source={data_source}); generated {len(questions_list)} Socratic why-questions "
-            f"and {len(control_wells)} structured control-well specs."
+            f"rationales ({epistemic_status}, calibrated={stance_calibrated}, "
+            f"conformal_set={conformal_stance_set}, data_source={data_source}); generated "
+            f"{len(questions_list)} Socratic why-questions and {len(control_wells)} control-well specs."
         )
 
     out["trace"].append(
@@ -899,6 +984,7 @@ if __name__ == "__main__":
                 "Transfer 100 uL aspirin solution and incubate at 37 C for 15 min "
                 "at 300 rpm to evaluate aqueous solubility."
             ),
+            "allow_synthetic_fixture": True,
             "parsed_spans": {
                 "amounts": ["100 uL"],
                 "temperatures": ["37 C"],

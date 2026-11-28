@@ -16,11 +16,16 @@ from lab_ask_why import (
     SplitConformalStanceClassifier,
     TruncatedSVDSemanticIndex,
     attribute_assay_outcome_permille,
+    chance_mcq_baseline,
+    compute_official_scifact_metrics,
     conformal_stance_set_permille,
     macro_f1_score,
+    majority_class_stance_baseline,
     mean_reciprocal_rank,
     split_scifact_train_fit_and_calib,
+    wilson_score_interval,
 )
+import lab_ask_why.frontier_verifier as fv_mod
 from lab_ask_why.frontier_verifier import _csr_matmul, _csr_rmatmul
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -286,3 +291,133 @@ def test_lean_parity_generator_and_permille_mirrors() -> None:
     assert live_res["zero_sorry_or_custom_axioms"] is True
     assert live_res["parity_cases_evaluated"] >= 100
     assert live_res["parity_mismatches"] == 0
+
+
+def test_issue_35_36_pure_numpy_vs_scipy_qhat_parity_wilson_ci_and_official_scifact() -> None:
+    corpus = {
+        idx: {
+            "doc_id": idx,
+            "title": f"Biomedical Study {idx}",
+            "abstract": [
+                f"Background context for experimental pathway {idx}.",
+                f"Compound C{idx} activates target kinase K{idx} and increases phosphorylation by {10 + idx}%.",
+                f"Inhibitor I{idx} blocks kinase K{idx} and reduces survival rather than increasing phosphorylation.",
+            ],
+        }
+        for idx in range(1, 25)
+    }
+    train_claims = []
+    for i in range(1, 25):
+        if i <= 8:
+            train_claims.append(
+                {
+                    "id": 100 + i,
+                    "claim": f"Compound C{i} activates kinase K{i} and increases phosphorylation.",
+                    "evidence": {str(i): [{"sentences": [1], "label": "SUPPORT"}]},
+                    "cited_doc_ids": [i],
+                }
+            )
+        elif i <= 16:
+            train_claims.append(
+                {
+                    "id": 100 + i,
+                    "claim": f"Inhibitor I{i} activates kinase K{i} and increases survival.",
+                    "evidence": {str(i): [{"sentences": [2], "label": "CONTRADICT"}]},
+                    "cited_doc_ids": [i],
+                }
+            )
+        else:
+            train_claims.append(
+                {
+                    "id": 100 + i,
+                    "claim": f"Compound C{i} regulates superconducting critical current in cuprates.",
+                    "evidence": {},
+                    "cited_doc_ids": [i],
+                }
+            )
+
+    orig_sp = fv_mod._sp
+    try:
+        fv_mod._sp = None
+        v_np = FrontierHybridVerifier.fit_on_scifact_train(
+            corpus, train_claims, svd_components=8, alpha=0.10, calib_fraction=0.25, seed=2026
+        )
+    finally:
+        fv_mod._sp = orig_sp
+
+    v_sp = FrontierHybridVerifier.fit_on_scifact_train(
+        corpus, train_claims, svd_components=8, alpha=0.10, calib_fraction=0.25, seed=2026
+    )
+
+    for key, val_sp in v_sp.training_provenance["conformal_calibration"].items():
+        val_np = v_np.training_provenance["conformal_calibration"][key]
+        assert abs(val_np - val_sp) < 1e-6, f"Mismatch on {key}: {val_np} vs {val_sp}"
+
+    # Verify chunked _csr_matmul / _csr_rmatmul with small block_rows=2 matches dense math
+    rng = np.random.default_rng(7)
+    dense_m = np.where(rng.random((9, 7)) > 0.6, rng.normal(size=(9, 7)), 0.0)
+    indptr = [0]
+    indices: list[int] = []
+    data: list[float] = []
+    for r in range(9):
+        nz = np.flatnonzero(dense_m[r])
+        indices.extend(int(c) for c in nz)
+        data.extend(float(dense_m[r, c]) for c in nz)
+        indptr.append(len(indices))
+    ip_arr = np.asarray(indptr, dtype=np.int32)
+    ix_arr = np.asarray(indices, dtype=np.int32)
+    dt_arr = np.asarray(data, dtype=np.float64)
+    rhs = rng.normal(size=(7, 4))
+    lhs_t = rng.normal(size=(9, 4))
+    np.testing.assert_allclose(
+        _csr_matmul(9, 7, ip_arr, ix_arr, dt_arr, rhs, sp_mat=None, block_rows=2),
+        dense_m @ rhs,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        _csr_rmatmul(9, 7, ip_arr, ix_arr, dt_arr, lhs_t, sp_mat=None, block_rows=2),
+        dense_m.T @ lhs_t,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    # Verify skewed high-frequency column rmatmul splits blocks via max_block_nnz
+    skew_m = rng.normal(size=(600, 6))
+    s_ip = np.arange(0, 3601, 6, dtype=np.int32)
+    s_ix = np.tile(np.arange(6, dtype=np.int32), 600)
+    s_dt = skew_m.reshape(-1)
+    s_lhs = rng.normal(size=(600, 5))
+    np.testing.assert_allclose(
+        _csr_rmatmul(600, 6, s_ip, s_ix, s_dt, s_lhs, sp_mat=None, block_rows=2048),
+        skew_m.T @ s_lhs,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    # Verify Wilson CI, majority baseline, chance MCQ baseline, and official SciFact F1
+    lo, hi = wilson_score_interval(90, 100)
+    assert 0.82 < lo < 0.90 < hi < 0.95
+    maj = majority_class_stance_baseline(
+        ["SUPPORT"] * 552 + ["CONTRADICT"] * 338 + ["NEI"] * 110,
+        eval_labels=STANCE_LABELS,
+    )
+    assert maj["majority_class_accuracy"] == pytest.approx(0.552)
+    ch = chance_mcq_baseline([4, 4, 4, 4])
+    assert ch["chance_hit@1"] == pytest.approx(0.25)
+    assert ch["chance_mrr"] == pytest.approx((1.0 + 0.5 + 1.0 / 3.0 + 0.25) / 4.0)
+
+    off = compute_official_scifact_metrics(
+        [
+            {"id": 1, "evidence": {"10": [{"sentences": [1, 2], "label": "SUPPORT"}]}},
+            {"id": 2, "evidence": {}},
+        ],
+        {
+            "1": {"10": {"label": "SUPPORT", "sentences": [1, 2]}},
+            "2": {},
+        },
+    )
+    assert off["abstract_label_only"]["f1"] == pytest.approx(1.0)
+    assert off["abstract_rationales"]["f1"] == pytest.approx(1.0)
+    assert off["sentence_selection"]["f1"] == pytest.approx(1.0)
+    assert off["sentence_label"]["f1"] == pytest.approx(1.0)

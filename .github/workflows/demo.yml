@@ -16,7 +16,7 @@ jobs:
         with:
           path: data/data.tar.gz
           key: scifact-data-v1-11c621288d41
-      - name: Install package and test dependencies
+      - name: Install package and test dependencies (numpy-only runtime)
         run: pip install -r requirements.txt -e ".[dev]"
       - name: Run offline unit and README drift test suite
         run: pytest -p no:cacheprovider -v
@@ -34,6 +34,10 @@ jobs:
           python demo/why_probe.py > /tmp/why_probe_stdout.txt
           grep -v '^Downloading ' /tmp/why_probe_stdout.txt > /tmp/why_probe_clean.txt
           diff -u demo/output.txt /tmp/why_probe_clean.txt
+      - name: Live real-SciFact pure-NumPy fit (< 3 GB RSS) and zero-drift check against committed JSON
+        timeout-minutes: 8
+        run: |
+          python scripts/benchmark_open_datasets.py --offline --scifact-only --pure-numpy --max-rss-mb 3000 --check-scifact-drift results/open_benchmarks_2026.json
 
   lean-4-parity:
     name: Lean 4.36.0 Axiom & Python Parity
